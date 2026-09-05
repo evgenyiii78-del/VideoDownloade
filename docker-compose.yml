@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./downloads:/app/downloads
+      # Uncomment if you use Instagram cookies:
+      # - ./cookies.txt:/app/secrets/cookies.txt:ro
