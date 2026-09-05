@@ -20,7 +20,7 @@ SUPPORTED_HOSTS = {
     "vt.tiktok.com": "TikTok",
 }
 
-URL_RE = re.compile(r"https?://[^\\s<>]+", re.IGNORECASE)
+URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -63,7 +63,7 @@ class DownloadResult:
 
 def extract_supported_url(text: str) -> tuple[str, str]:
     for match in URL_RE.finditer(text or ""):
-        raw_url = match.group(0).rstrip(".,;:!?)]}\\\"'")
+        raw_url = match.group(0).rstrip(".,;:!?)]}\"'")
         parsed = urlparse(raw_url)
         host = (parsed.hostname or "").lower().rstrip(".")
         platform = SUPPORTED_HOSTS.get(host)
