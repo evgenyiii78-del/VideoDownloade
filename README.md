@@ -1,4 +1,4 @@
-# VideoDownloaderBot v0.1.1
+# VideoDownloaderBot v0.2.0
 
 Telegram-бот для скачивания доступных пользователю видео по ссылкам из Instagram и TikTok.
 
@@ -9,7 +9,7 @@ Telegram-бот для скачивания доступных пользова�
 - короткие `vm.tiktok.com` и `vt.tiktok.com` ссылки
 - автоматическое определение платформы
 - `yt-dlp` + FFmpeg
-- Instagram-сессия через `.env` или `cookies.txt`
+- автоматический Instagram fallback через `vxinstagram.com` / Open Graph\n- Instagram-сессия через `.env` или `cookies.txt` как дополнительный вариант
 - ограничение параллельных загрузок
 - автоматическая очистка временных файлов
 - Docker / Docker Compose
@@ -94,3 +94,15 @@ python bot.py
 | `INSTAGRAM_DS_USER_ID` | пусто | cookie `ds_user_id` |
 | `COOKIES_FILE` | пусто | альтернативный путь к Netscape cookies |
 | `FFMPEG_LOCATION` | пусто | путь к FFmpeg, если он не в `PATH` |
+
+
+## Как работает Instagram в v0.2.0
+
+1. Бот принимает обычную ссылку вида `https://www.instagram.com/reel/HASH/`.
+2. Сначала пробует скачать её напрямую через `yt-dlp`.
+3. Если Instagram блокирует прямое получение, бот автоматически строит `https://vxinstagram.com/reel/HASH/`.
+4. Из Open Graph метаданных извлекается прямой URL видео.
+5. MP4 скачивается ботом и отправляется в Telegram.
+6. Если первый proxy недоступен, предусмотрен второй best-effort fallback.
+
+Пользователю не нужно вручную менять ссылку.
