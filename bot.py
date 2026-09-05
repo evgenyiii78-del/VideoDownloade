@@ -71,7 +71,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
 
         try:
-            caption_lines = [f"✅ {result.platform}"]
+            caption_lines = [f"✅ {result.platform}"]\n            if result.source != "yt-dlp":\n                logger.info("Downloaded via fallback source: %s", result.source)
             if result.author:
                 caption_lines.append(f"👤 {result.author}")
             caption = "\n".join(caption_lines)
