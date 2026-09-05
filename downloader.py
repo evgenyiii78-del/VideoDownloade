@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import html
 import re
 import shutil
 import uuid
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
+import httpx
 import yt_dlp
 
 SUPPORTED_HOSTS = {
@@ -29,6 +32,19 @@ DEFAULT_HEADERS = {
         "Mobile/15E148 Safari/604.1"
     ),
     "Accept-Language": "en-US,en;q=0.9",
+}
+
+INSTAGRAM_PROXY_HOSTS = (
+    "vxinstagram.com",
+    "ddinstagram.com",
+)
+
+VIDEO_META_KEYS = {
+    "og:video",
+    "og:video:url",
+    "og:video:secure_url",
+    "twitter:player:stream",
+    "twitter:player:stream:url",
 }
 
 
@@ -56,9 +72,25 @@ class DownloadResult:
     webpage_url: str
     size_bytes: int
     work_dir: Path
+    source: str = "yt-dlp"
 
     def cleanup(self) -> None:
         shutil.rmtree(self.work_dir, ignore_errors=True)
+
+
+class _MetaParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.meta: dict[str, str] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "meta":
+            return
+        values = {str(k).lower(): (v or "") for k, v in attrs}
+        key = (values.get("property") or values.get("name") or "").lower()
+        content = values.get("content", "")
+        if key and content and key not in self.meta:
+            self.meta[key] = content
 
 
 def extract_supported_url(text: str) -> tuple[str, str]:
@@ -70,6 +102,22 @@ def extract_supported_url(text: str) -> tuple[str, str]:
         if platform:
             return raw_url, platform
     raise UnsupportedUrlError("No supported Instagram or TikTok URL found")
+
+
+def build_instagram_proxy_urls(url: str) -> list[str]:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if host not in {"instagram.com", "www.instagram.com", "m.instagram.com"}:
+        return []
+
+    path = parsed.path or "/"
+    if not path.endswith("/"):
+        path += "/"
+
+    return [
+        urlunparse(("https", proxy_host, path, "", "", ""))
+        for proxy_host in INSTAGRAM_PROXY_HOSTS
+    ]
 
 
 def _pick_output_file(work_dir: Path, info: dict) -> Path:
@@ -93,17 +141,22 @@ def _pick_output_file(work_dir: Path, info: dict) -> Path:
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
-def download_video(
+def _check_size(path: Path, max_upload_mb: int) -> int:
+    size_bytes = path.stat().st_size
+    size_mb = size_bytes / (1024 * 1024)
+    if size_mb > max_upload_mb:
+        raise FileTooLargeError(size_mb, max_upload_mb)
+    return size_bytes
+
+
+def _download_with_ytdlp(
     url: str,
     platform: str,
-    download_root: Path,
+    work_dir: Path,
     max_upload_mb: int,
-    cookies_file: Path | None = None,
-    ffmpeg_location: str | None = None,
+    cookies_file: Path | None,
+    ffmpeg_location: str | None,
 ) -> DownloadResult:
-    work_dir = download_root / uuid.uuid4().hex
-    work_dir.mkdir(parents=True, exist_ok=False)
-
     ydl_opts: dict = {
         "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
         "merge_output_format": "mp4",
@@ -124,33 +177,178 @@ def download_video(
     if ffmpeg_location:
         ydl_opts["ffmpeg_location"] = ffmpeg_location
 
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+
+    if not isinstance(info, dict):
+        raise DownloadError("Unexpected response from yt-dlp")
+
+    output = _pick_output_file(work_dir, info)
+    size_bytes = _check_size(output, max_upload_mb)
+
+    title = str(info.get("title") or info.get("description") or "Видео")
+    author = info.get("uploader") or info.get("creator") or info.get("channel")
+
+    return DownloadResult(
+        path=output,
+        title=title[:200],
+        author=str(author)[:100] if author else None,
+        platform=platform,
+        webpage_url=str(info.get("webpage_url") or url),
+        size_bytes=size_bytes,
+        work_dir=work_dir,
+        source="yt-dlp",
+    )
+
+
+def _extract_proxy_media(client: httpx.Client, proxy_url: str) -> tuple[str, str, str | None]:
+    response = client.get(proxy_url)
+    response.raise_for_status()
+
+    content_type = response.headers.get("content-type", "").lower()
+    if content_type.startswith("video/"):
+        return str(response.url), "Instagram video", None
+
+    parser = _MetaParser()
+    parser.feed(response.text)
+
+    media_url = None
+    for key in VIDEO_META_KEYS:
+        value = parser.meta.get(key)
+        if value:
+            media_url = html.unescape(value)
+            break
+
+    if not media_url:
+        raise DownloadError(f"No direct video metadata found at {proxy_url}")
+
+    title = html.unescape(
+        parser.meta.get("og:title")
+        or parser.meta.get("twitter:title")
+        or "Instagram video"
+    )
+    author = parser.meta.get("og:site_name")
+    return media_url, title, author
+
+
+def _download_direct_media(
+    client: httpx.Client,
+    media_url: str,
+    target: Path,
+    max_upload_mb: int,
+) -> int:
+    max_bytes = max_upload_mb * 1024 * 1024
+
+    with client.stream("GET", media_url) as response:
+        response.raise_for_status()
+
+        content_length = response.headers.get("content-length")
+        if content_length:
+            try:
+                announced = int(content_length)
+            except ValueError:
+                announced = 0
+            if announced > max_bytes:
+                raise FileTooLargeError(announced / (1024 * 1024), max_upload_mb)
+
+        total = 0
+        with target.open("wb") as file:
+            for chunk in response.iter_bytes(chunk_size=1024 * 256):
+                total += len(chunk)
+                if total > max_bytes:
+                    raise FileTooLargeError(total / (1024 * 1024), max_upload_mb)
+                file.write(chunk)
+
+    return total
+
+
+def _download_instagram_via_proxy(
+    original_url: str,
+    work_dir: Path,
+    max_upload_mb: int,
+) -> DownloadResult:
+    errors: list[str] = []
+
+    with httpx.Client(
+        headers=DEFAULT_HEADERS,
+        follow_redirects=True,
+        timeout=httpx.Timeout(30.0, read=90.0),
+    ) as client:
+        for proxy_url in build_instagram_proxy_urls(original_url):
+            try:
+                media_url, title, author = _extract_proxy_media(client, proxy_url)
+                target = work_dir / "instagram_proxy.mp4"
+                size_bytes = _download_direct_media(client, media_url, target, max_upload_mb)
+
+                return DownloadResult(
+                    path=target,
+                    title=title[:200],
+                    author=author[:100] if author else None,
+                    platform="Instagram",
+                    webpage_url=original_url,
+                    size_bytes=size_bytes,
+                    work_dir=work_dir,
+                    source=urlparse(proxy_url).hostname or "proxy",
+                )
+            except FileTooLargeError:
+                raise
+            except Exception as exc:
+                errors.append(f"{proxy_url}: {exc}")
+
+    raise DownloadError("Instagram proxy fallback failed: " + " | ".join(errors))
+
+
+def download_video(
+    url: str,
+    platform: str,
+    download_root: Path,
+    max_upload_mb: int,
+    cookies_file: Path | None = None,
+    ffmpeg_location: str | None = None,
+) -> DownloadResult:
+    work_dir = download_root / uuid.uuid4().hex
+    work_dir.mkdir(parents=True, exist_ok=False)
+
+    primary_error: Exception | None = None
+
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+        try:
+            return _download_with_ytdlp(
+                url=url,
+                platform=platform,
+                work_dir=work_dir,
+                max_upload_mb=max_upload_mb,
+                cookies_file=cookies_file,
+                ffmpeg_location=ffmpeg_location,
+            )
+        except FileTooLargeError:
+            raise
+        except Exception as exc:
+            primary_error = exc
 
-        if not isinstance(info, dict):
-            raise DownloadError("Unexpected response from yt-dlp")
+        if platform == "Instagram":
+            try:
+                return _download_instagram_via_proxy(
+                    original_url=url,
+                    work_dir=work_dir,
+                    max_upload_mb=max_upload_mb,
+                )
+            except FileTooLargeError:
+                raise
+            except Exception as proxy_exc:
+                raise DownloadError(
+                    f"Instagram direct download failed: {primary_error}; "
+                    f"proxy fallback failed: {proxy_exc}"
+                ) from proxy_exc
 
-        output = _pick_output_file(work_dir, info)
-        size_bytes = output.stat().st_size
-        size_mb = size_bytes / (1024 * 1024)
-        if size_mb > max_upload_mb:
-            raise FileTooLargeError(size_mb, max_upload_mb)
+        if isinstance(primary_error, yt_dlp.utils.DownloadError):
+            raise DownloadError(str(primary_error)) from primary_error
+        raise DownloadError(str(primary_error) if primary_error else "Unknown download error")
 
-        title = str(info.get("title") or info.get("description") or "Видео")
-        author = info.get("uploader") or info.get("creator") or info.get("channel")
-        webpage_url = str(info.get("webpage_url") or url)
-
-        return DownloadResult(
-            path=output,
-            title=title[:200],
-            author=str(author)[:100] if author else None,
-            platform=platform,
-            webpage_url=webpage_url,
-            size_bytes=size_bytes,
-            work_dir=work_dir,
-        )
     except FileTooLargeError:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise
+    except DownloadError:
         shutil.rmtree(work_dir, ignore_errors=True)
         raise
     except yt_dlp.utils.DownloadError as exc:
