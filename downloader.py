@@ -20,7 +20,16 @@ SUPPORTED_HOSTS = {
     "vt.tiktok.com": "TikTok",
 }
 
-URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+URL_RE = re.compile(r"https?://[^\\s<>]+", re.IGNORECASE)
+
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 "
+        "Mobile/15E148 Safari/604.1"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 class DownloadError(RuntimeError):
@@ -54,7 +63,7 @@ class DownloadResult:
 
 def extract_supported_url(text: str) -> tuple[str, str]:
     for match in URL_RE.finditer(text or ""):
-        raw_url = match.group(0).rstrip(".,;:!?)]}\"'")
+        raw_url = match.group(0).rstrip(".,;:!?)]}\\\"'")
         parsed = urlparse(raw_url)
         host = (parsed.hostname or "").lower().rstrip(".")
         platform = SUPPORTED_HOSTS.get(host)
@@ -101,12 +110,13 @@ def download_video(
         "outtmpl": str(work_dir / "%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
-        "no_warnings": True,
+        "no_warnings": False,
         "restrictfilenames": True,
         "retries": 3,
         "fragment_retries": 3,
         "socket_timeout": 30,
         "overwrites": True,
+        "http_headers": DEFAULT_HEADERS,
     }
 
     if cookies_file is not None:
