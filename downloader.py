@@ -162,8 +162,8 @@ def _download_with_ytdlp(
     source_label: str = "yt-dlp",
 ) -> DownloadResult:
     ydl_opts: dict = {
-        "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
-        "merge_output_format": "mp4",
+        # Prefer a ready-to-send single MP4 file so hosting without FFmpeg still works.
+        "format": "b[ext=mp4]/b",
         "outtmpl": str(work_dir / "%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
