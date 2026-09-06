@@ -65,14 +65,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 chat_id=message.chat_id,
                 action=ChatAction.UPLOAD_VIDEO,
             )
-            result = await asyncio.to_thread(
-                download_video,
-                url,
-                platform,
-                SETTINGS.download_dir,
-                SETTINGS.max_upload_mb,
-                SETTINGS.cookies_file,
-                SETTINGS.ffmpeg_location,
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    download_video,
+                    url,
+                    platform,
+                    SETTINGS.download_dir,
+                    SETTINGS.max_upload_mb,
+                    SETTINGS.cookies_file,
+                    SETTINGS.ffmpeg_location,
+                ),
+                timeout=120,
             )
 
         try:
@@ -109,6 +112,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         finally:
             result.cleanup()
 
+    except asyncio.TimeoutError:
+        logger.warning("Download timed out for %s", url)
+        await status.edit_text("⏱ Не удалось скачать видео за 2 минуты. Попробуйте ещё раз или другую ссылку.")
     except FileTooLargeError as exc:
         logger.info("Video too large: %.1f MB", exc.size_mb)
         await status.edit_text(
@@ -131,7 +137,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def main() -> None:
-    app = Application.builder().token(SETTINGS.bot_token).build()
+    app = (
+        Application.builder()
+        .token(SETTINGS.bot_token)
+        .concurrent_updates(True)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
