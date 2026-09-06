@@ -11,6 +11,9 @@ from urllib.parse import urlparse, urlunparse
 
 import httpx
 import yt_dlp
+import logging
+
+logger = logging.getLogger("video_downloader_bot.downloader")
 
 SUPPORTED_HOSTS = {
     "instagram.com": "Instagram",
@@ -324,6 +327,12 @@ def download_video(
     public_error: Exception | None = None
     auth_error: Exception | None = None
 
+    if platform == "Instagram":
+        logger.info(
+            "Instagram download started; service session configured: %s",
+            "yes" if cookies_file is not None else "no",
+        )
+
     try:
         # 1) Always try a public download first. This keeps TikTok and
         # public Instagram links independent from the service account.
@@ -341,6 +350,8 @@ def download_video(
             raise
         except Exception as exc:
             public_error = exc
+            if platform == "Instagram":
+                logger.warning("Instagram public download failed: %s", exc)
 
         # 2) Instagram only: retry with the bot's server-side service session.
         # Users never need to provide their own Instagram credentials.
@@ -360,6 +371,7 @@ def download_video(
                 raise
             except Exception as exc:
                 auth_error = exc
+                logger.warning("Instagram service-session download failed: %s", exc)
 
         # 3) Best-effort public metadata fallback.
         if platform == "Instagram":
@@ -373,6 +385,7 @@ def download_video(
             except FileTooLargeError:
                 raise
             except Exception as proxy_exc:
+                logger.warning("Instagram proxy fallback failed: %s", proxy_exc)
                 auth_state = (
                     f"service session failed: {auth_error}; "
                     if cookies_file is not None
