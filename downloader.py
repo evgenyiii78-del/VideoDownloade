@@ -156,6 +156,7 @@ def _download_with_ytdlp(
     max_upload_mb: int,
     cookies_file: Path | None,
     ffmpeg_location: str | None,
+    source_label: str = "yt-dlp",
 ) -> DownloadResult:
     ydl_opts: dict = {
         "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
@@ -197,7 +198,7 @@ def _download_with_ytdlp(
         webpage_url=str(info.get("webpage_url") or url),
         size_bytes=size_bytes,
         work_dir=work_dir,
-        source="yt-dlp",
+        source=source_label,
     )
 
 
@@ -298,6 +299,17 @@ def _download_instagram_via_proxy(
     raise DownloadError("Instagram proxy fallback failed: " + " | ".join(errors))
 
 
+def _clear_work_dir(work_dir: Path) -> None:
+    for item in work_dir.iterdir():
+        if item.is_file() or item.is_symlink():
+            try:
+                item.unlink()
+            except OSError:
+                pass
+        elif item.is_dir():
+            shutil.rmtree(item, ignore_errors=True)
+
+
 def download_video(
     url: str,
     platform: str,
@@ -309,24 +321,49 @@ def download_video(
     work_dir = download_root / uuid.uuid4().hex
     work_dir.mkdir(parents=True, exist_ok=False)
 
-    primary_error: Exception | None = None
+    public_error: Exception | None = None
+    auth_error: Exception | None = None
 
     try:
+        # 1) Always try a public download first. This keeps TikTok and
+        # public Instagram links independent from the service account.
         try:
             return _download_with_ytdlp(
                 url=url,
                 platform=platform,
                 work_dir=work_dir,
                 max_upload_mb=max_upload_mb,
-                cookies_file=cookies_file,
+                cookies_file=None,
                 ffmpeg_location=ffmpeg_location,
+                source_label="yt-dlp-public",
             )
         except FileTooLargeError:
             raise
         except Exception as exc:
-            primary_error = exc
+            public_error = exc
 
+        # 2) Instagram only: retry with the bot's server-side service session.
+        # Users never need to provide their own Instagram credentials.
+        if platform == "Instagram" and cookies_file is not None:
+            _clear_work_dir(work_dir)
+            try:
+                return _download_with_ytdlp(
+                    url=url,
+                    platform=platform,
+                    work_dir=work_dir,
+                    max_upload_mb=max_upload_mb,
+                    cookies_file=cookies_file,
+                    ffmpeg_location=ffmpeg_location,
+                    source_label="yt-dlp-service-session",
+                )
+            except FileTooLargeError:
+                raise
+            except Exception as exc:
+                auth_error = exc
+
+        # 3) Best-effort public metadata fallback.
         if platform == "Instagram":
+            _clear_work_dir(work_dir)
             try:
                 return _download_instagram_via_proxy(
                     original_url=url,
@@ -336,14 +373,20 @@ def download_video(
             except FileTooLargeError:
                 raise
             except Exception as proxy_exc:
+                auth_state = (
+                    f"service session failed: {auth_error}; "
+                    if cookies_file is not None
+                    else "service session is not configured; "
+                )
                 raise DownloadError(
-                    f"Instagram direct download failed: {primary_error}; "
+                    f"Instagram public download failed: {public_error}; "
+                    f"{auth_state}"
                     f"proxy fallback failed: {proxy_exc}"
                 ) from proxy_exc
 
-        if isinstance(primary_error, yt_dlp.utils.DownloadError):
-            raise DownloadError(str(primary_error)) from primary_error
-        raise DownloadError(str(primary_error) if primary_error else "Unknown download error")
+        if isinstance(public_error, yt_dlp.utils.DownloadError):
+            raise DownloadError(str(public_error)) from public_error
+        raise DownloadError(str(public_error) if public_error else "Unknown download error")
 
     except FileTooLargeError:
         shutil.rmtree(work_dir, ignore_errors=True)
