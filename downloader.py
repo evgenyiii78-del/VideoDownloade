@@ -75,6 +75,8 @@ class DownloadResult:
     webpage_url: str
     size_bytes: int
     work_dir: Path
+    width: int | None = None
+    height: int | None = None
     source: str = "yt-dlp"
 
     def cleanup(self) -> None:
@@ -201,6 +203,8 @@ def _download_with_ytdlp(
         webpage_url=str(info.get("webpage_url") or url),
         size_bytes=size_bytes,
         work_dir=work_dir,
+        width=int(info["width"]) if info.get("width") else None,
+        height=int(info["height"]) if info.get("height") else None,
         source=source_label,
     )
 
@@ -292,6 +296,8 @@ def _download_instagram_via_proxy(
                     webpage_url=original_url,
                     size_bytes=size_bytes,
                     work_dir=work_dir,
+                    width=None,
+                    height=None,
                     source=urlparse(proxy_url).hostname or "proxy",
                 )
             except FileTooLargeError:
