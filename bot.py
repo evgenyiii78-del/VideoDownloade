@@ -59,7 +59,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     try:
         async with DOWNLOAD_SEMAPHORE:
-            await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.UPLOAD_VIDEO)
+            await context.bot.send_chat_action(
+                chat_id=message.chat_id,
+                action=ChatAction.UPLOAD_VIDEO,
+            )
             result = await asyncio.to_thread(
                 download_video,
                 url,
@@ -71,7 +74,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
 
         try:
-            caption_lines = [f"✅ {result.platform}"]\n            if result.source != "yt-dlp":\n                logger.info("Downloaded via fallback source: %s", result.source)
+            caption_lines = [f"✅ {result.platform}"]
+            if result.source != "yt-dlp":
+                logger.info("Downloaded via fallback source: %s", result.source)
             if result.author:
                 caption_lines.append(f"👤 {result.author}")
             caption = "\n".join(caption_lines)
