@@ -89,6 +89,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                         video=video_file,
                         caption=caption,
                         supports_streaming=True,
+                        width=result.width,
+                        height=result.height,
                         read_timeout=180,
                         write_timeout=180,
                         connect_timeout=30,
