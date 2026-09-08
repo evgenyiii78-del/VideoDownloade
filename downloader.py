@@ -637,8 +637,16 @@ def _pin_id_from_html(text: str) -> str | None:
 
 
 def _pinterest_pin_id(client: httpx.Client, url: str) -> str:
-    # pin.it may return either HTTP redirects or a small HTML redirect page.
-    # Validate each network hop to avoid following arbitrary external hosts.
+    # Bypass pin.it itself when possible. Pinterest short links map directly to
+    # api.pinterest.com/url_shortener/<code>/redirect/, which is more reliable
+    # from hosting providers where pin.it can return a non-redirect response.
+    parsed = urlparse(url)
+    if (parsed.hostname or "").lower().rstrip(".") == "pin.it":
+        short_code = parsed.path.strip("/").split("/", 1)[0]
+        if re.fullmatch(r"[A-Za-z0-9_-]+", short_code or ""):
+            url = f"https://api.pinterest.com/url_shortener/{short_code}/redirect/"
+
+    # Follow Pinterest-owned redirects only.
     for _ in range(10):
         parsed = urlparse(url)
         if not _is_pinterest_host(parsed.hostname or ""):
