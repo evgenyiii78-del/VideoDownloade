@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
+import time
 
-from telegram import Update
-from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from config import Settings
 from downloader import (
@@ -13,6 +15,7 @@ from downloader import (
     FileTooLargeError,
     UnsupportedUrlError,
     download_video,
+    download_audio,
     extract_supported_url,
 )
 
@@ -28,12 +31,27 @@ SETTINGS = Settings.from_env()
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(SETTINGS.max_concurrent_downloads)
 
 WELCOME = (
-    "🎬 Отправьте ссылку на видео из Instagram или TikTok.\n\n"
-    "Поддерживаются:\n"
-    "• Instagram Reels / видеопосты\n"
-    "• TikTok и короткие vm.tiktok.com / vt.tiktok.com ссылки\n\n"
-    "Бот предназначен для публично доступных видео и контента, который вы имеете право скачивать."
+    "🎬 Отправьте ссылку на ролик из Instagram, TikTok, YouTube или Pinterest.\n\n"
+    "Поддерживаются YouTube Shorts и короткие ссылки youtu.be / pin.it.\n"
+    "После ссылки выберите: 🎬 Видео или 🎵 MP3.\n"
+    "Pinterest: фото и видеопины.\n\n"
+    "Скачивайте материалы, которые вы имеете право сохранять."
 )
+CHOICES: dict[str, tuple[int, int, str, str, float]] = {}
+ACTIVE_USERS: set[int] = set()
+
+
+def remember_choice(user_id: int, chat_id: int, url: str, platform: str) -> str:
+    now = time.monotonic()
+    for key, value in list(CHOICES.items()):
+        if now - value[4] > 3600:
+            CHOICES.pop(key, None)
+    while len(CHOICES) >= 1000:
+        CHOICES.pop(next(iter(CHOICES)))
+    key = secrets.token_hex(8)
+    CHOICES[key] = (user_id, chat_id, url, platform, now)
+    return key
+
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -54,29 +72,68 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         url, platform = extract_supported_url(message.text)
     except UnsupportedUrlError:
-        await message.reply_text("Пришлите ссылку на Instagram или TikTok.")
+        await message.reply_text("Пришлите ссылку на Instagram, TikTok, YouTube или Pinterest.")
         return
 
-    status = await message.reply_text(f"⏳ Скачиваю видео из {platform}…")
+    key = remember_choice(update.effective_user.id, message.chat_id, url, platform)
+    await message.reply_text(
+        f"{platform}: что скачать?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🖼 Фото / видео" if platform == "Pinterest" else "🎬 Видео", callback_data=f"download:video:{key}"),
+            InlineKeyboardButton("🎵 MP3", callback_data=f"download:audio:{key}"),
+        ]]),
+    )
+
+
+async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.message is None:
+        return
+    _, mode, key = query.data.split(":", 2)
+    choice = CHOICES.get(key)
+    if choice is None or time.monotonic() - choice[4] > 3600:
+        await query.answer("Кнопка устарела. Пришлите ссылку ещё раз.", show_alert=True)
+        return
+    user_id, chat_id, url, platform, _ = choice
+    if query.from_user.id != user_id or query.message.chat_id != chat_id:
+        await query.answer("Эти кнопки для отправителя ссылки.", show_alert=True)
+        return
+    if user_id in ACTIVE_USERS:
+        await query.answer("Дождитесь завершения текущей загрузки.", show_alert=True)
+        return
+    ACTIVE_USERS.add(user_id)
+    try:
+        await query.answer()
+        await send_download(query.message, context, url, platform, mode)
+    finally:
+        ACTIVE_USERS.discard(user_id)
+
+
+async def _download(url: str, platform: str, mode: str):
+    async with DOWNLOAD_SEMAPHORE:
+        return await asyncio.to_thread(
+            download_audio if mode == "audio" else download_video,
+            url, platform, SETTINGS.download_dir, SETTINGS.max_upload_mb,
+            SETTINGS.cookies_file, SETTINGS.ffmpeg_location,
+        )
+
+
+def _cleanup_late_download(task):
+    if not task.cancelled():
+        try:
+            task.result().cleanup()
+        except Exception:
+            pass
+
+
+async def send_download(message, context, url: str, platform: str, mode: str) -> None:
+    status = await message.reply_text("⏳ В очереди на скачивание…")
+    task = None
 
     try:
-        async with DOWNLOAD_SEMAPHORE:
-            await context.bot.send_chat_action(
-                chat_id=message.chat_id,
-                action=ChatAction.UPLOAD_VIDEO,
-            )
-            result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    download_video,
-                    url,
-                    platform,
-                    SETTINGS.download_dir,
-                    SETTINGS.max_upload_mb,
-                    SETTINGS.cookies_file,
-                    SETTINGS.ffmpeg_location,
-                ),
-                timeout=120,
-            )
+        await status.edit_text(f"⏳ Готовлю {'MP3' if mode == 'audio' else 'видео'} из {platform}…")
+        task = asyncio.create_task(_download(url, platform, mode))
+        result = await asyncio.wait_for(asyncio.shield(task), timeout=300)
 
         try:
             caption_lines = [f"✅ {result.platform}"]
@@ -87,7 +144,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             caption = "\n".join(caption_lines)
 
             with result.path.open("rb") as video_file:
-                if result.path.suffix.lower() == ".mp4":
+                if mode == "audio":
+                    await message.reply_audio(
+                        audio=video_file, title=result.title, performer=result.author,
+                        caption=caption, read_timeout=180, write_timeout=180,
+                        connect_timeout=30, pool_timeout=30,
+                    )
+                elif result.source == "pinterest-photo":
+                    try:
+                        await message.reply_photo(photo=video_file, caption=caption,
+                                                  read_timeout=180, write_timeout=180)
+                    except BadRequest:
+                        video_file.seek(0)
+                        await message.reply_document(document=video_file, caption=caption,
+                                                     read_timeout=180, write_timeout=180)
+                elif result.path.suffix.lower() == ".mp4":
                     await message.reply_video(
                         video=video_file,
                         caption=caption,
@@ -113,19 +184,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             result.cleanup()
 
     except asyncio.TimeoutError:
+        if task is not None:
+            task.add_done_callback(_cleanup_late_download)
         logger.warning("Download timed out for %s", url)
-        await status.edit_text("⏱ Не удалось скачать видео за 2 минуты. Попробуйте ещё раз или другую ссылку.")
+        await status.edit_text("⏱ Не удалось скачать файл за 5 минут. Попробуйте ещё раз или другую ссылку.")
     except FileTooLargeError as exc:
         logger.info("Video too large: %.1f MB", exc.size_mb)
         await status.edit_text(
-            f"⚠️ Видео весит {exc.size_mb:.1f} МБ и превышает установленный лимит "
+            f"⚠️ Файл весит {exc.size_mb:.1f} МБ и превышает установленный лимит "
             f"{exc.limit_mb} МБ."
         )
     except DownloadError as exc:
         logger.warning("Download failed for %s: %s", url, exc)
         await status.edit_text(
-            "❌ Не удалось скачать видео. Возможно, публикация приватная, удалена, "
-            "требует авторизации или Instagram/TikTok изменил способ выдачи видео."
+            "❌ Не удалось скачать файл. Для MP3 нужен ролик со звуком. "
+            "Для YouTube и MP3 на сервере должен быть FFmpeg. "
+            " Возможно, публикация приватная, удалена, "
+            "требует авторизации или сайт изменил способ выдачи видео."
         )
     except Exception:
         logger.exception("Unexpected error while processing %s", url)
@@ -145,6 +220,7 @@ def main() -> None:
     )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(handle_choice, pattern=r"^download:(video|audio):[0-9a-f]{16}$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
 

@@ -4,10 +4,14 @@ import html
 import re
 import shutil
 import uuid
+import subprocess
+import json
+import os
+from dataclasses import replace
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse, urljoin
 
 import httpx
 import yt_dlp
@@ -16,6 +20,19 @@ import logging
 logger = logging.getLogger("video_downloader_bot.downloader")
 
 SUPPORTED_HOSTS = {
+    "youtube.com": "YouTube",
+    "www.youtube.com": "YouTube",
+    "m.youtube.com": "YouTube",
+    "youtu.be": "YouTube",
+    "pinterest.com": "Pinterest",
+    "www.pinterest.com": "Pinterest",
+    "ru.pinterest.com": "Pinterest",
+    "pinterest.ru": "Pinterest",
+    "www.pinterest.ru": "Pinterest",
+    "pin.it": "Pinterest",
+    "de.pinterest.com": "Pinterest",
+    "pinterest.de": "Pinterest",
+    "www.pinterest.de": "Pinterest",
     "instagram.com": "Instagram",
     "www.instagram.com": "Instagram",
     "m.instagram.com": "Instagram",
@@ -106,7 +123,7 @@ def extract_supported_url(text: str) -> tuple[str, str]:
         platform = SUPPORTED_HOSTS.get(host)
         if platform:
             return raw_url, platform
-    raise UnsupportedUrlError("No supported Instagram or TikTok URL found")
+    raise UnsupportedUrlError("No supported video URL found")
 
 
 def build_instagram_proxy_urls(url: str) -> list[str]:
@@ -126,6 +143,9 @@ def build_instagram_proxy_urls(url: str) -> list[str]:
 
 
 def _pick_output_file(work_dir: Path, info: dict) -> Path:
+    final_path = info.get("filepath") or info.get("_filename")
+    if final_path and Path(final_path).is_file():
+        return Path(final_path)
     requested = info.get("requested_downloads") or []
     for item in requested:
         filepath = item.get("filepath")
@@ -162,6 +182,7 @@ def _download_with_ytdlp(
     cookies_file: Path | None,
     ffmpeg_location: str | None,
     source_label: str = "yt-dlp",
+    audio: bool = False,
 ) -> DownloadResult:
     ydl_opts: dict = {
         # Prefer a ready-to-send single MP4 file so hosting without FFmpeg still works.
@@ -178,6 +199,19 @@ def _download_with_ytdlp(
         "http_headers": DEFAULT_HEADERS,
     }
 
+    if platform == "YouTube":
+        # YouTube usually supplies separate audio/video streams.
+        ydl_opts["format"] = "bv[ext=mp4][height<=720]+ba[ext=m4a]/b[ext=mp4]/b"
+        ydl_opts["merge_output_format"] = "mp4"
+        ydl_opts["js_runtimes"] = {"deno": {}, "node": {}}
+    if audio:
+        ydl_opts["format"] = "bestaudio/best"
+        ydl_opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192",
+        }]
+    ydl_opts["max_filesize"] = max_upload_mb * 1024 * 1024
+    ydl_opts["playlistend"] = 1
+
     if cookies_file is not None:
         ydl_opts["cookiefile"] = str(cookies_file)
     if ffmpeg_location:
@@ -189,7 +223,13 @@ def _download_with_ytdlp(
     if not isinstance(info, dict):
         raise DownloadError("Unexpected response from yt-dlp")
 
-    output = _pick_output_file(work_dir, info)
+    if audio:
+        outputs = list(work_dir.glob("*.mp3"))
+        if not outputs:
+            raise DownloadError("No MP3 was produced; the video may have no audio")
+        output = outputs[0]
+    else:
+        output = _pick_output_file(work_dir, info)
     size_bytes = _check_size(output, max_upload_mb)
 
     title = str(info.get("title") or info.get("description") or "Видео")
@@ -340,6 +380,10 @@ def download_video(
         )
 
     try:
+        if platform == "Pinterest":
+            photo = _download_pinterest_photo(url, work_dir, max_upload_mb)
+            if photo is not None:
+                return photo
         # 1) Always try a public download first. This keeps TikTok and
         # public Instagram links independent from the service account.
         try:
@@ -419,3 +463,120 @@ def download_video(
     except Exception:
         shutil.rmtree(work_dir, ignore_errors=True)
         raise
+
+
+def _ffmpeg_binary(location: str | None) -> str:
+    if location:
+        path = Path(location)
+        if path.is_dir():
+            path = path / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+        binary = str(path)
+    else:
+        binary = shutil.which("ffmpeg")
+    if not binary or not Path(binary).is_file():
+        raise DownloadError("Для MP3 и YouTube нужен FFmpeg на сервере (FFMPEG_LOCATION).")
+    return binary
+
+
+def convert_to_mp3(result: DownloadResult, max_upload_mb: int,
+                   ffmpeg_location: str | None = None) -> DownloadResult:
+    target = result.work_dir / "audio.mp3"
+    try:
+        subprocess.run(
+            [_ffmpeg_binary(ffmpeg_location), "-nostdin", "-y", "-v", "error",
+             "-i", str(result.path), "-map", "0:a:0", "-vn", "-c:a", "libmp3lame",
+             "-b:a", "192k", str(target)],
+            check=True, capture_output=True, timeout=300,
+        )
+        return replace(result, path=target, size_bytes=_check_size(target, max_upload_mb),
+                       width=None, height=None)
+    except FileTooLargeError:
+        result.cleanup()
+        raise
+    except Exception as exc:
+        result.cleanup()
+        raise DownloadError("Не удалось получить MP3. Проверьте, есть ли звук в ролике и FFmpeg на сервере.") from exc
+
+
+def download_audio(url: str, platform: str, download_root: Path,
+                   max_upload_mb: int, cookies_file: Path | None = None,
+                   ffmpeg_location: str | None = None) -> DownloadResult:
+    _ffmpeg_binary(ffmpeg_location)
+    if platform == "Instagram":
+        result = download_video(url, platform, download_root, max_upload_mb,
+                                cookies_file, ffmpeg_location)
+        return convert_to_mp3(result, max_upload_mb, ffmpeg_location)
+    work_dir = download_root / uuid.uuid4().hex
+    work_dir.mkdir(parents=True, exist_ok=False)
+    try:
+        return _download_with_ytdlp(url, platform, work_dir, max_upload_mb,
+                                   None, ffmpeg_location, audio=True)
+    except Exception as exc:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        if isinstance(exc, DownloadError):
+            raise
+        raise DownloadError("Не удалось получить MP3 из ролика.") from exc
+
+
+def _pinterest_pin_id(client: httpx.Client, url: str) -> str:
+    for _ in range(6):
+        parsed = urlparse(url)
+        if SUPPORTED_HOSTS.get((parsed.hostname or "").lower()) != "Pinterest":
+            raise DownloadError("Ссылка должна вести на пин Pinterest.")
+        match = re.fullmatch(r"/pin/(?:[\w-]+--)?(\d+)/?", parsed.path)
+        if match:
+            return match.group(1)
+        response = client.get(url, follow_redirects=False)
+        if not response.is_redirect:
+            response.raise_for_status()
+        location = response.headers.get("location")
+        if not location:
+            raise DownloadError("Не удалось раскрыть короткую ссылку Pinterest.")
+        url = urljoin(url, location)
+    raise DownloadError("Слишком много перенаправлений Pinterest.")
+
+
+def _pin_photo_url(data: dict) -> str | None:
+    # Never send a video's cover as if it were a photo pin.
+    if data.get("videos") or data.get("embed") or data.get("story_pin_data"):
+        return None
+    images = data.get("images") or {}
+    candidates = [v for v in images.values() if isinstance(v, dict) and v.get("url")]
+    if not candidates:
+        raise DownloadError("В этом пине не найдено фото или видео.")
+    original = images.get("orig")
+    best = original if isinstance(original, dict) and original.get("url") else max(
+        candidates, key=lambda v: (v.get("width") or 0) * (v.get("height") or 0))
+    url = best["url"]
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not (host == "pinimg.com" or host.endswith(".pinimg.com")):
+        raise DownloadError("Неизвестный адрес изображения Pinterest.")
+    return url
+
+
+def _download_pinterest_photo(url: str, work_dir: Path, max_upload_mb: int) -> DownloadResult | None:
+    with httpx.Client(headers=DEFAULT_HEADERS, timeout=30, follow_redirects=False) as client:
+        pin_id = _pinterest_pin_id(client, url)
+        response = client.get(
+            "https://www.pinterest.com/resource/PinResource/get/",
+            params={"data": json.dumps({"options": {
+                "field_set_key": "unauth_react_main_pin", "id": pin_id,
+            }})},
+            headers={"X-Pinterest-PWS-Handler": "www/[username].js"},
+        )
+        response.raise_for_status()
+        data = response.json()["resource_response"]["data"]
+        if not isinstance(data, dict):
+            raise DownloadError("Пин недоступен.")
+        photo_url = _pin_photo_url(data)
+        if photo_url is None:
+            return None
+        suffix = Path(urlparse(photo_url).path).suffix.lower()
+        if suffix not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+            suffix = ".jpg"
+        target = work_dir / (pin_id + suffix)
+        size = _download_direct_media(client, photo_url, target, max_upload_mb)
+        author = (data.get("closeup_attribution") or {}).get("full_name")
+        return DownloadResult(target, str(data.get("title") or "Pinterest")[:200],
+                              author, "Pinterest", url, size, work_dir, source="pinterest-photo")
