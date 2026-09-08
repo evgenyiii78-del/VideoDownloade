@@ -50,6 +50,15 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(_pinterest_pin_id(client, 'https://pin.it/abc'), '456')
 
         client.get.side_effect = None
+
+        html_response = Mock(is_redirect=False, headers={}, text=(
+            '<html><head><meta property="og:url" '
+            'content="https://www.pinterest.com/pin/789/"></head></html>'
+        ))
+        html_response.raise_for_status = Mock()
+        client.get.return_value = html_response
+        self.assertEqual(_pinterest_pin_id(client, 'https://pin.it/abc'), '789')
+
         response.headers = {'location': 'http://127.0.0.1/internal'}
         client.get.return_value = response
         with self.assertRaises(DownloadError):
