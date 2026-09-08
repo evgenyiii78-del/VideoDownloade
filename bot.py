@@ -10,6 +10,7 @@ from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from config import Settings
+from russian import download_russian
 from downloader import (
     DownloadError,
     NoMediaFileError,
@@ -35,6 +36,7 @@ WELCOME = (
     "🎬 Отправьте ссылку на ролик из Instagram, TikTok, YouTube или Pinterest.\n\n"
     "Поддерживаются YouTube Shorts и короткие ссылки youtu.be / pin.it.\n"
     "После ссылки выберите: 🎬 Видео или 🎵 MP3.\n"
+    "Для YouTube также доступны русская аудиодорожка и субтитры.\n"
     "Pinterest: фото и видеопины.\n\n"
     "Скачивайте материалы, которые вы имеете право сохранять."
 )
@@ -82,7 +84,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🖼 Фото / видео" if platform == "Pinterest" else "🎬 Видео", callback_data=f"download:video:{key}"),
             InlineKeyboardButton("🎵 MP3", callback_data=f"download:audio:{key}"),
-        ]]),
+        ]] + ([[
+            InlineKeyboardButton("🇷🇺 Русская дорожка", callback_data=f"download:ruvideo:{key}"),
+            InlineKeyboardButton("📝 Русские субтитры", callback_data=f"download:rusubs:{key}"),
+        ]] if platform == "YouTube" else [])),
     )
 
 
@@ -112,6 +117,11 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def _download(url: str, platform: str, mode: str):
     async with DOWNLOAD_SEMAPHORE:
+        if mode in {"ruvideo", "rusubs"}:
+            return await asyncio.to_thread(
+                download_russian, url, platform, SETTINGS.download_dir, SETTINGS.max_upload_mb,
+                SETTINGS.cookies_file, SETTINGS.ffmpeg_location, subtitles=mode == "rusubs",
+            )
         return await asyncio.to_thread(
             download_audio if mode == "audio" else download_video,
             url, platform, SETTINGS.download_dir, SETTINGS.max_upload_mb,
@@ -132,12 +142,19 @@ async def send_download(message, context, url: str, platform: str, mode: str) ->
     task = None
 
     try:
-        await status.edit_text(f"⏳ Готовлю {'MP3' if mode == 'audio' else 'видео'} из {platform}…")
+        label = {"audio": "MP3", "ruvideo": "видео с русской дорожкой", "rusubs": "русские субтитры"}.get(mode, "видео")
+        await status.edit_text(f"⏳ Готовлю {label} из {platform}…")
         task = asyncio.create_task(_download(url, platform, mode))
         result = await asyncio.wait_for(asyncio.shield(task), timeout=300)
 
         try:
             caption_lines = [f"✅ {result.platform}"]
+            if mode == "ruvideo":
+                caption_lines.append("🇷🇺 Русская аудиодорожка YouTube")
+            elif mode == "rusubs":
+                caption_lines.append("📝 Русские субтитры — отдельный файл")
+                if result.source == "russian-auto-captions":
+                    caption_lines.append("Автоматические субтитры YouTube")
             if result.source != "yt-dlp":
                 logger.info("Downloaded via fallback source: %s", result.source)
             if result.author:
@@ -221,7 +238,7 @@ def main() -> None:
     )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CallbackQueryHandler(handle_choice, pattern=r"^download:(video|audio):[0-9a-f]{16}$"))
+    app.add_handler(CallbackQueryHandler(handle_choice, pattern=r"^download:(video|audio|ruvideo|rusubs):[0-9a-f]{16}$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
 

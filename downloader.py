@@ -211,6 +211,7 @@ def _download_with_ytdlp_once(
     source_label: str = "yt-dlp",
     audio: bool = False,
     max_height: int = 720,
+    russian: bool = False,
 ) -> DownloadResult:
     download_log = _DownloadLogger(max_upload_mb)
     ydl_opts: dict = {
@@ -236,6 +237,13 @@ def _download_with_ytdlp_once(
                               f"bv[height<={max_height}]+ba/b[height<={max_height}]")
         ydl_opts["merge_output_format"] = "mp4"
         ydl_opts["js_runtimes"] = youtube_js_runtimes()
+    if russian:
+        ydl_opts["format"] = (
+            f"bv[vcodec^=avc1][height<={max_height}]+ba[language^=ru]/"
+            f"b[vcodec^=avc1][language^=ru][height<={max_height}]/"
+            f"bv[height<={max_height}]+ba[language^=ru]/"
+            f"b[language^=ru][height<={max_height}]"
+        )
     if audio:
         ydl_opts["format"] = "bestaudio/best"
         ydl_opts["postprocessors"] = [{
@@ -288,14 +296,14 @@ def _download_with_ytdlp_once(
 
 
 def _download_with_ytdlp(url, platform, work_dir, max_upload_mb, cookies_file,
-                         ffmpeg_location, source_label="yt-dlp", audio=False):
+                         ffmpeg_location, source_label="yt-dlp", audio=False, russian=False):
     heights = (720, 480, 360, 240) if platform == "YouTube" and not audio else (720,)
     size_error = None
     for height in heights:
         try:
             return _download_with_ytdlp_once(
                 url, platform, work_dir, max_upload_mb, cookies_file,
-                ffmpeg_location, source_label, audio, max_height=height,
+                ffmpeg_location, source_label, audio, max_height=height, russian=russian,
             )
         except FileTooLargeError as exc:
             size_error = exc
