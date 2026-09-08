@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
+from media_runtime import resolve_ffmpeg
 
 load_dotenv()
 
@@ -71,7 +72,7 @@ class Settings:
         if cookies_file is None:
             cookies_file = _build_instagram_cookie_file(download_dir)
 
-        ffmpeg_location = os.getenv("FFMPEG_LOCATION", "").strip() or None
+        ffmpeg_location = resolve_ffmpeg()
 
         return cls(
             bot_token=token,

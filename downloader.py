@@ -15,6 +15,7 @@ from urllib.parse import urlparse, urlunparse, urljoin
 
 import httpx
 import yt_dlp
+from media_runtime import resolve_ffmpeg, youtube_js_runtimes
 import logging
 
 logger = logging.getLogger("video_downloader_bot.downloader")
@@ -203,7 +204,7 @@ def _download_with_ytdlp(
         # YouTube usually supplies separate audio/video streams.
         ydl_opts["format"] = "bv[ext=mp4][height<=720]+ba[ext=m4a]/b[ext=mp4]/b"
         ydl_opts["merge_output_format"] = "mp4"
-        ydl_opts["js_runtimes"] = {"deno": {}, "node": {}}
+        ydl_opts["js_runtimes"] = youtube_js_runtimes()
     if audio:
         ydl_opts["format"] = "bestaudio/best"
         ydl_opts["postprocessors"] = [{
@@ -214,8 +215,9 @@ def _download_with_ytdlp(
 
     if cookies_file is not None:
         ydl_opts["cookiefile"] = str(cookies_file)
-    if ffmpeg_location:
-        ydl_opts["ffmpeg_location"] = ffmpeg_location
+    effective_ffmpeg = ffmpeg_location or resolve_ffmpeg()
+    if effective_ffmpeg:
+        ydl_opts["ffmpeg_location"] = effective_ffmpeg
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -466,6 +468,7 @@ def download_video(
 
 
 def _ffmpeg_binary(location: str | None) -> str:
+    location = location or resolve_ffmpeg()
     if location:
         path = Path(location)
         if path.is_dir():

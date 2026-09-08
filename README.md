@@ -1,4 +1,4 @@
-# VideoDownloaderBot v0.4.0
+# VideoDownloaderBot v0.4.1
 
 Telegram-бот для скачивания доступных пользователю видео по ссылкам из Instagram, TikTok, YouTube и Pinterest.
 
@@ -14,7 +14,7 @@ Telegram-бот для скачивания доступных пользова�
 
 Обновите код из GitHub, переустановите зависимости из `requirements.txt` и перезапустите бота.
 При Docker-развёртывании пересоберите образ: он уже содержит FFmpeg и Node.js 22.
-При обычном Python-развёртывании нужны FFmpeg и Node.js 22+ (или Deno 2+), доступные в PATH.
+При обычном Python-развёртывании FFmpeg и Node.js устанавливаются с `requirements.txt`. Бот находит встроенные бинарники без `apt`, root и правки PATH. После обновления на Bothost обязательно запустите переустановку зависимостей / пересборку, затем перезапуск. Простого перезапуска старого окружения недостаточно.
 Токен и настройки Instagram в `.env` сохраняются.
 
 YouTube использует `yt-dlp[default]` и JavaScript runtime по [документации yt-dlp](https://github.com/yt-dlp/yt-dlp#dependencies).
@@ -88,7 +88,7 @@ COOKIES_FILE=/app/secrets/cookies.txt
 
 ## Быстрый запуск в Windows
 
-Требуется Python 3.11–3.13 и FFmpeg в `PATH`.
+Требуется Python 3.11–3.13. FFmpeg и Node.js устанавливаются вместе с Python-зависимостями.
 
 ```powershell
 python -m venv .venv
@@ -123,3 +123,7 @@ python bot.py
 5. MP4 отправляется пользователю в Telegram.
 
 Пользователю не нужно входить в Instagram, передавать cookies или менять ссылку. Служебную сессию один раз настраивает администратор бота в переменных окружения Bothost.
+
+## Исправление v0.4.1
+
+Для Python-хостинга бинарники поставляются пакетами [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg) и [nodejs-wheel-binaries](https://pypi.org/project/nodejs-wheel-binaries/). Системный FFmpeg и явный `FFMPEG_LOCATION` сохраняют приоритет. Встроенный Node.js передаётся yt-dlp по абсолютному пути.

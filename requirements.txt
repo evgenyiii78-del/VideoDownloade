@@ -1,3 +1,5 @@
 python-telegram-bot==22.8
 yt-dlp[default]
 python-dotenv
+imageio-ffmpeg==0.6.0
+nodejs-wheel-binaries==22.20.0
