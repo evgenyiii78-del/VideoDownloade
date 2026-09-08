@@ -38,7 +38,20 @@ class MediaTests(unittest.TestCase):
         response = Mock(is_redirect=True, headers={'location': 'https://www.pinterest.com/pin/123/'})
         client.get.return_value = response
         self.assertEqual(_pinterest_pin_id(client, 'https://pin.it/abc'), '123')
+
+        # Real pin.it links can use api.pinterest.com as an intermediate hop.
+        first = Mock(is_redirect=True, headers={
+            'location': 'https://api.pinterest.com/url_shortener/abc/redirect/',
+        })
+        second = Mock(is_redirect=True, headers={
+            'location': 'https://www.pinterest.com/pin/456/',
+        })
+        client.get.side_effect = [first, second]
+        self.assertEqual(_pinterest_pin_id(client, 'https://pin.it/abc'), '456')
+
+        client.get.side_effect = None
         response.headers = {'location': 'http://127.0.0.1/internal'}
+        client.get.return_value = response
         with self.assertRaises(DownloadError):
             _pinterest_pin_id(client, 'https://pin.it/abc')
 
