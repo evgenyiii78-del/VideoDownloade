@@ -598,36 +598,82 @@ def _is_pinterest_host(host: str) -> bool:
     )
 
 
+def _pin_id_from_url(url: str) -> str | None:
+    parsed = urlparse(url)
+    if not _is_pinterest_host(parsed.hostname or ""):
+        return None
+    match = re.fullmatch(r"/pin/(?:[\w-]+--)?(\d+)/?", parsed.path)
+    return match.group(1) if match else None
+
+
+def _pin_id_from_html(text: str) -> str | None:
+    if not text:
+        return None
+
+    decoded = html.unescape(text).replace(r"\/", "/")
+
+    # Pinterest/shortener pages commonly expose the destination in og:url,
+    # a canonical-like absolute link or embedded JSON.
+    parser = _MetaParser()
+    try:
+        parser.feed(decoded)
+    except Exception:
+        pass
+
+    for key in ("og:url", "twitter:url"):
+        candidate = parser.meta.get(key)
+        if candidate:
+            pin_id = _pin_id_from_url(candidate)
+            if pin_id:
+                return pin_id
+
+    match = re.search(
+        r"https?://(?:[\w-]+\.)?pinterest\.(?:com|ru|de)"
+        r"/pin/(?:[\w-]+--)?(\d+)/?",
+        decoded,
+        re.IGNORECASE,
+    )
+    return match.group(1) if match else None
+
+
 def _pinterest_pin_id(client: httpx.Client, url: str) -> str:
-    # pin.it redirects through api.pinterest.com/url_shortener/.../redirect/
-    # before reaching the final /pin/<id>/ page. Validate every hop so
-    # short-link support cannot follow redirects to arbitrary hosts.
+    # pin.it may return either HTTP redirects or a small HTML redirect page.
+    # Validate each network hop to avoid following arbitrary external hosts.
     for _ in range(10):
         parsed = urlparse(url)
         if not _is_pinterest_host(parsed.hostname or ""):
             raise DownloadError("Ссылка должна вести на пин Pinterest.")
 
-        match = re.fullmatch(r"/pin/(?:[\w-]+--)?(\d+)/?", parsed.path)
-        if match:
-            return match.group(1)
+        pin_id = _pin_id_from_url(url)
+        if pin_id:
+            return pin_id
 
         response = client.get(url, follow_redirects=False)
-        if not response.is_redirect:
-            response.raise_for_status()
 
-        location = response.headers.get("location")
-        if not location:
-            raise DownloadError("Не удалось раскрыть короткую ссылку Pinterest.")
+        if response.is_redirect:
+            location = response.headers.get("location")
+            if not location:
+                raise DownloadError("Не удалось раскрыть короткую ссылку Pinterest.")
 
-        next_url = urljoin(url, location)
-        next_host = urlparse(next_url).hostname or ""
-        if not _is_pinterest_host(next_host):
-            raise DownloadError("Ссылка должна вести на пин Pinterest.")
+            next_url = urljoin(url, location)
+            next_host = urlparse(next_url).hostname or ""
+            if not _is_pinterest_host(next_host):
+                raise DownloadError("Ссылка должна вести на пин Pinterest.")
 
-        url = next_url
+            url = next_url
+            continue
+
+        response.raise_for_status()
+
+        # Some pin.it requests from hosting providers receive HTTP 200 instead
+        # of Location. Extract the real pin URL from the returned HTML.
+        pin_id = _pin_id_from_html(response.text)
+        if pin_id:
+            return pin_id
+
+        raise DownloadError("Не удалось раскрыть короткую ссылку Pinterest.")
 
     raise DownloadError("Слишком много перенаправлений Pinterest.")
-
 def _pin_photo_url(data: dict) -> str | None:
     # Never send a video's cover as if it were a photo pin.
     if data.get("videos") or data.get("embed") or data.get("story_pin_data"):
