@@ -35,9 +35,15 @@ class MediaTests(unittest.TestCase):
 
     def test_short_link_redirect_validation(self):
         client = Mock()
-        response = Mock(is_redirect=True, headers={'location': 'https://www.pinterest.com/pin/123/'})
+        response = Mock(is_redirect=True, headers={
+            'location': 'https://www.pinterest.com/pin/123/sent/?invite_code=test',
+        })
         client.get.return_value = response
         self.assertEqual(_pinterest_pin_id(client, 'https://pin.it/abc'), '123')
+        client.get.assert_called_with(
+            'https://api.pinterest.com/url_shortener/abc/redirect/',
+            follow_redirects=False,
+        )
 
         # Real pin.it links can use api.pinterest.com as an intermediate hop.
         first = Mock(is_redirect=True, headers={
