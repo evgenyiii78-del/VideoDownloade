@@ -231,7 +231,9 @@ def _download_with_ytdlp_once(
 
     if platform == "YouTube":
         # YouTube usually supplies separate audio/video streams.
-        ydl_opts["format"] = f"bv[ext=mp4][height<={max_height}]+ba[ext=m4a]/b[ext=mp4][height<={max_height}]/b[height<={max_height}]"
+        ydl_opts["format"] = (f"bv[vcodec^=avc1][height<={max_height}]+ba[acodec^=mp4a]/"
+                              f"b[vcodec^=avc1][acodec^=mp4a][height<={max_height}]/"
+                              f"bv[height<={max_height}]+ba/b[height<={max_height}]")
         ydl_opts["merge_output_format"] = "mp4"
         ydl_opts["js_runtimes"] = youtube_js_runtimes()
     if audio:
@@ -264,6 +266,8 @@ def _download_with_ytdlp_once(
         output = outputs[0]
     else:
         output = _pick_output_file(work_dir, info)
+    if platform == "YouTube" and not audio:
+        output = _prepare_telegram_video(output, effective_ffmpeg)
     size_bytes = _check_size(output, max_upload_mb)
 
     title = str(info.get("title") or info.get("description") or "Видео")
@@ -638,3 +642,38 @@ def _download_pinterest_photo(url: str, work_dir: Path, max_upload_mb: int) -> D
         author = (data.get("closeup_attribution") or {}).get("full_name")
         return DownloadResult(target, str(data.get("title") or "Pinterest")[:200],
                               author, "Pinterest", url, size, work_dir, source="pinterest-photo")
+
+
+def _prepare_telegram_video(source: Path, ffmpeg_location: str | None) -> Path:
+    """Validate actual streams; produce H.264/yuv420p + AAC with faststart."""
+    binary = _ffmpeg_binary(ffmpeg_location)
+    try:
+        probe = subprocess.run([binary, '-nostdin', '-hide_banner', '-i', str(source)],
+                               capture_output=True, text=True, timeout=30)
+        streams = probe.stderr
+        video = re.search(r'Stream[^\n]*Video: ([^\n]+)', streams)
+        audio = re.search(r'Stream[^\n]*Audio: ([^\n]+)', streams)
+        if video is None or audio is None:
+            raise NoMediaFileError('Скачанный файл не содержит одновременно видео и звук. Файл не отправлен; попробуйте другую ссылку.')
+        compatible_video = video.group(1).startswith('h264 ') and 'yuv420p(' in video.group(1)
+        compatible_video = compatible_video or (video.group(1).startswith('h264 ') and 'yuv420p,' in video.group(1))
+        compatible_audio = audio.group(1).startswith('aac ')
+        target = source.with_name(source.stem + '.telegram.mp4')
+        args = [binary, '-nostdin', '-y', '-v', 'error', '-i', str(source),
+                '-map', '0:v:0', '-map', '0:a:0', '-sn', '-dn']
+        if compatible_video:
+            args += ['-c:v', 'copy']
+        else:
+            args += ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '25',
+                     '-pix_fmt', 'yuv420p', '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2']
+        args += ['-c:a', 'copy'] if compatible_audio else ['-c:a', 'aac', '-b:a', '128k']
+        args += ['-movflags', '+faststart', str(target)]
+        logger.info('Preparing Telegram MP4: video=%s audio=%s',
+                    'copy H264' if compatible_video else 'convert H264',
+                    'copy AAC' if compatible_audio else 'convert AAC')
+        subprocess.run(args, check=True, capture_output=True, timeout=300)
+        return target
+    except NoMediaFileError:
+        raise
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise NoMediaFileError('Не удалось подготовить совместимое видео для Telegram. Попробуйте более короткий ролик.') from exc

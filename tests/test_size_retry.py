@@ -22,7 +22,7 @@ class SizeRetryTests(unittest.TestCase):
                         return {'id': 'video'}
                     (work / 'video.mp4').write_bytes(b'video')
                     return {'id': 'video', 'title': 'Video', 'width': 854, 'height': 480}
-            with patch('downloader.yt_dlp.YoutubeDL', FakeYDL):
+            with patch('downloader.yt_dlp.YoutubeDL', FakeYDL), patch('downloader._prepare_telegram_video', side_effect=lambda path, _: path):
                 result = _download_with_ytdlp('https://youtu.be/test', 'YouTube', work, 49, None, None)
             self.assertEqual(len(options), 2)
             self.assertIn('height<=480', options[1]['format'])
