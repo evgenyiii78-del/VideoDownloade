@@ -588,23 +588,45 @@ def download_audio(url: str, platform: str, download_root: Path,
         raise DownloadError("Не удалось получить MP3 из ролика.") from exc
 
 
+def _is_pinterest_host(host: str) -> bool:
+    host = (host or "").lower().rstrip(".")
+    if host == "pin.it":
+        return True
+    return any(
+        host == domain or host.endswith("." + domain)
+        for domain in ("pinterest.com", "pinterest.ru", "pinterest.de")
+    )
+
+
 def _pinterest_pin_id(client: httpx.Client, url: str) -> str:
-    for _ in range(6):
+    # pin.it redirects through api.pinterest.com/url_shortener/.../redirect/
+    # before reaching the final /pin/<id>/ page. Validate every hop so
+    # short-link support cannot follow redirects to arbitrary hosts.
+    for _ in range(10):
         parsed = urlparse(url)
-        if SUPPORTED_HOSTS.get((parsed.hostname or "").lower()) != "Pinterest":
+        if not _is_pinterest_host(parsed.hostname or ""):
             raise DownloadError("Ссылка должна вести на пин Pinterest.")
-        match = re.fullmatch(r"/pin/(?:[\w-]+--)?(\d+)/?", parsed.path)
+
+        match = re.fullmatch(r"/pin/(?:[\\w-]+--)?(\\d+)/?", parsed.path)
         if match:
             return match.group(1)
+
         response = client.get(url, follow_redirects=False)
         if not response.is_redirect:
             response.raise_for_status()
+
         location = response.headers.get("location")
         if not location:
             raise DownloadError("Не удалось раскрыть короткую ссылку Pinterest.")
-        url = urljoin(url, location)
-    raise DownloadError("Слишком много перенаправлений Pinterest.")
 
+        next_url = urljoin(url, location)
+        next_host = urlparse(next_url).hostname or ""
+        if not _is_pinterest_host(next_host):
+            raise DownloadError("Ссылка должна вести на пин Pinterest.")
+
+        url = next_url
+
+    raise DownloadError("Слишком много перенаправлений Pinterest.")
 
 def _pin_photo_url(data: dict) -> str | None:
     # Never send a video's cover as if it were a photo pin.
