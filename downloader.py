@@ -602,7 +602,7 @@ def _pin_id_from_url(url: str) -> str | None:
     parsed = urlparse(url)
     if not _is_pinterest_host(parsed.hostname or ""):
         return None
-    match = re.fullmatch(r"/pin/(?:[\w-]+--)?(\d+)/?", parsed.path)
+    match = re.match(r"^/pin/(?:[\w-]+--)?(\d+)(?:/|$)", parsed.path)
     return match.group(1) if match else None
 
 
@@ -629,7 +629,7 @@ def _pin_id_from_html(text: str) -> str | None:
 
     match = re.search(
         r"https?://(?:[\w-]+\.)?pinterest\.(?:com|ru|de)"
-        r"/pin/(?:[\w-]+--)?(\d+)/?",
+        r"/pin/(?:[\w-]+--)?(\d+)(?:/|$)",
         decoded,
         re.IGNORECASE,
     )
