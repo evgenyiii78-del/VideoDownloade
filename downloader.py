@@ -607,7 +607,7 @@ def _pinterest_pin_id(client: httpx.Client, url: str) -> str:
         if not _is_pinterest_host(parsed.hostname or ""):
             raise DownloadError("Ссылка должна вести на пин Pinterest.")
 
-        match = re.fullmatch(r"/pin/(?:[\\w-]+--)?(\\d+)/?", parsed.path)
+        match = re.fullmatch(r"/pin/(?:[\w-]+--)?(\d+)/?", parsed.path)
         if match:
             return match.group(1)
 
