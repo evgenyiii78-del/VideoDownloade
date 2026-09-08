@@ -12,6 +12,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from config import Settings
 from downloader import (
     DownloadError,
+    NoMediaFileError,
     FileTooLargeError,
     UnsupportedUrlError,
     download_video,
@@ -194,13 +195,13 @@ async def send_download(message, context, url: str, platform: str, mode: str) ->
             f"⚠️ Файл весит {exc.size_mb:.1f} МБ и превышает установленный лимит "
             f"{exc.limit_mb} МБ."
         )
+    except NoMediaFileError as exc:
+        await status.edit_text(f"❌ {exc}")
     except DownloadError as exc:
         logger.warning("Download failed for %s: %s", url, exc)
         await status.edit_text(
-            "❌ Не удалось скачать файл. Для MP3 нужен ролик со звуком. "
-            "Для YouTube и MP3 на сервере должен быть FFmpeg. "
-            " Возможно, публикация приватная, удалена, "
-            "требует авторизации или сайт изменил способ выдачи видео."
+            "❌ Не удалось получить файл с сайта. Публикация может быть недоступна "
+            "или сайт ограничил загрузку. Подробная причина записана в логах бота."
         )
     except Exception:
         logger.exception("Unexpected error while processing %s", url)

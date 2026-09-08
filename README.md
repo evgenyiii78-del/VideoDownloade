@@ -1,4 +1,4 @@
-# VideoDownloaderBot v0.4.1
+# VideoDownloaderBot v0.4.2
 
 Telegram-бот для скачивания доступных пользователю видео по ссылкам из Instagram, TikTok, YouTube и Pinterest.
 
@@ -127,3 +127,7 @@ python bot.py
 ## Исправление v0.4.1
 
 Для Python-хостинга бинарники поставляются пакетами [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg) и [nodejs-wheel-binaries](https://pypi.org/project/nodejs-wheel-binaries/). Системный FFmpeg и явный `FFMPEG_LOCATION` сохраняют приоритет. Встроенный Node.js передаётся yt-dlp по абсолютному пути.
+
+## Исправление v0.4.2
+
+Пропуск yt-dlp из-за MAX_UPLOAD_MB теперь распознаётся как превышение размера. Для YouTube бот повторяет загрузку в 480p, 360p и 240p, если выбранный вариант слишком большой. Если ни один не помещается, показывает лимит размера. Ошибка отсутствия файла больше не объясняется отсутствием FFmpeg.

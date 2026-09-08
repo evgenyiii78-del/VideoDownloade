@@ -77,6 +77,32 @@ class UnsupportedUrlError(DownloadError):
     pass
 
 
+class NoMediaFileError(DownloadError):
+    pass
+
+
+class _DownloadLogger:
+    def __init__(self, limit_mb: int):
+        self.limit_mb = limit_mb
+        self.skipped_size = None
+
+    def debug(self, message):
+        # yt-dlp reports max_filesize skips as ordinary output, not an exception.
+        if 'larger than max-filesize' in message:
+            match = re.search(r"\((\d+) bytes", message)
+            self.skipped_size = int(match.group(1)) if match else self.limit_mb * 1024 * 1024 + 1
+        logger.debug('%s', message)
+
+    def info(self, message):
+        self.debug(message)
+
+    def warning(self, message):
+        logger.warning('%s', message)
+
+    def error(self, message):
+        logger.error('%s', message)
+
+
 class FileTooLargeError(DownloadError):
     def __init__(self, size_mb: float, limit_mb: int) -> None:
         self.size_mb = size_mb
@@ -163,7 +189,7 @@ def _pick_output_file(work_dir: Path, info: dict) -> Path:
         and not p.name.endswith(".part")
     ]
     if not candidates:
-        raise DownloadError("yt-dlp finished, but no video file was found")
+        raise NoMediaFileError("Сайт не выдал готовый видеофайл. Попробуйте другую ссылку; если ошибка повторяется, нужны логи загрузки.")
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
@@ -175,7 +201,7 @@ def _check_size(path: Path, max_upload_mb: int) -> int:
     return size_bytes
 
 
-def _download_with_ytdlp(
+def _download_with_ytdlp_once(
     url: str,
     platform: str,
     work_dir: Path,
@@ -184,8 +210,11 @@ def _download_with_ytdlp(
     ffmpeg_location: str | None,
     source_label: str = "yt-dlp",
     audio: bool = False,
+    max_height: int = 720,
 ) -> DownloadResult:
+    download_log = _DownloadLogger(max_upload_mb)
     ydl_opts: dict = {
+        "logger": download_log,
         # Prefer a ready-to-send single MP4 file so hosting without FFmpeg still works.
         "format": "b[ext=mp4]/b",
         "outtmpl": str(work_dir / "%(id)s.%(ext)s"),
@@ -202,7 +231,7 @@ def _download_with_ytdlp(
 
     if platform == "YouTube":
         # YouTube usually supplies separate audio/video streams.
-        ydl_opts["format"] = "bv[ext=mp4][height<=720]+ba[ext=m4a]/b[ext=mp4]/b"
+        ydl_opts["format"] = f"bv[ext=mp4][height<={max_height}]+ba[ext=m4a]/b[ext=mp4][height<={max_height}]/b[height<={max_height}]"
         ydl_opts["merge_output_format"] = "mp4"
         ydl_opts["js_runtimes"] = youtube_js_runtimes()
     if audio:
@@ -221,6 +250,9 @@ def _download_with_ytdlp(
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
+
+    if download_log.skipped_size is not None:
+        raise FileTooLargeError(download_log.skipped_size / (1024 * 1024), max_upload_mb)
 
     if not isinstance(info, dict):
         raise DownloadError("Unexpected response from yt-dlp")
@@ -249,6 +281,27 @@ def _download_with_ytdlp(
         height=int(info["height"]) if info.get("height") else None,
         source=source_label,
     )
+
+
+def _download_with_ytdlp(url, platform, work_dir, max_upload_mb, cookies_file,
+                         ffmpeg_location, source_label="yt-dlp", audio=False):
+    heights = (720, 480, 360, 240) if platform == "YouTube" and not audio else (720,)
+    size_error = None
+    for height in heights:
+        try:
+            return _download_with_ytdlp_once(
+                url, platform, work_dir, max_upload_mb, cookies_file,
+                ffmpeg_location, source_label, audio, max_height=height,
+            )
+        except FileTooLargeError as exc:
+            size_error = exc
+            logger.info('File exceeds %s MB at %sp; trying smaller format', max_upload_mb, height)
+            _clear_work_dir(work_dir)
+        except yt_dlp.utils.DownloadError as exc:
+            if size_error is None or 'Requested format is not available' not in str(exc):
+                raise
+            _clear_work_dir(work_dir)
+    raise size_error
 
 
 def _extract_proxy_media(client: httpx.Client, proxy_url: str) -> tuple[str, str, str | None]:
@@ -449,6 +502,8 @@ def download_video(
                     f"proxy fallback failed: {proxy_exc}"
                 ) from proxy_exc
 
+        if isinstance(public_error, DownloadError):
+            raise public_error
         if isinstance(public_error, yt_dlp.utils.DownloadError):
             raise DownloadError(str(public_error)) from public_error
         raise DownloadError(str(public_error) if public_error else "Unknown download error")
