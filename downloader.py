@@ -244,6 +244,12 @@ def _download_with_ytdlp_once(
         # TikTok increasingly rejects plain datacenter HTTP fingerprints.
         # yt-dlp can use curl_cffi (installed via requirements extra) to mimic Chrome.
         ydl_opts["impersonate"] = "chrome"
+    elif platform == "Pinterest":
+        # Pinterest video pins often expose separate/non-premerged formats.
+        # The generic b[ext=mp4]/b selector can therefore report
+        # "Requested format is not available".
+        ydl_opts["format"] = "bv*+ba/b"
+        ydl_opts["merge_output_format"] = "mp4"
     if russian:
         ydl_opts["format"] = (
             f"bv[vcodec^=avc1][height<={max_height}]+ba[language^=ru]/"
@@ -536,9 +542,9 @@ def download_video(
 
     try:
         if platform == "Pinterest":
-            photo = _download_pinterest_photo(url, work_dir, max_upload_mb)
-            if photo is not None:
-                return photo
+            pinterest_media = _download_pinterest_media(url, work_dir, max_upload_mb)
+            if pinterest_media is not None:
+                return pinterest_media
         # 1) Always try a public download first. This keeps TikTok and
         # public Instagram links independent from the service account.
         try:
@@ -681,9 +687,12 @@ def download_audio(url: str, platform: str, download_root: Path,
                    max_upload_mb: int, cookies_file: Path | None = None,
                    ffmpeg_location: str | None = None) -> DownloadResult:
     _ffmpeg_binary(ffmpeg_location)
-    if platform in {"Instagram", "TikTok"}:
+    if platform in {"Instagram", "TikTok", "Pinterest"}:
         result = download_video(url, platform, download_root, max_upload_mb,
                                 cookies_file, ffmpeg_location)
+        if result.source == "pinterest-photo":
+            result.cleanup()
+            raise DownloadError("Это фото Pinterest — звуковой дорожки нет.")
         return convert_to_mp3(result, max_upload_mb, ffmpeg_location)
     work_dir = download_root / uuid.uuid4().hex
     work_dir.mkdir(parents=True, exist_ok=False)
@@ -791,26 +800,91 @@ def _pinterest_pin_id(client: httpx.Client, url: str) -> str:
         raise DownloadError("Не удалось раскрыть короткую ссылку Pinterest.")
 
     raise DownloadError("Слишком много перенаправлений Pinterest.")
+def _is_pinimg_host(host: str) -> bool:
+    host = (host or "").lower().rstrip(".")
+    return host == "pinimg.com" or host.endswith(".pinimg.com")
+
+
+def _pin_video_info(data: dict) -> tuple[str, int | None, int | None] | None:
+    candidates: list[tuple[str, int | None, int | None, int]] = []
+
+    def add_candidate(item: object) -> None:
+        if not isinstance(item, dict):
+            return
+        value = item.get("url")
+        if not isinstance(value, str) or not value:
+            return
+
+        parsed = urlparse(value)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path.lower()
+        mime = str(item.get("content_type") or item.get("mime_type") or "").lower()
+
+        if parsed.scheme != "https" or not _is_pinimg_host(host):
+            return
+        if not (path.endswith(".mp4") or "video/mp4" in mime):
+            return
+
+        width = int(item["width"]) if item.get("width") else None
+        height = int(item["height"]) if item.get("height") else None
+        area = (width or 0) * (height or 0)
+        candidates.append((value, width, height, area))
+
+    videos = data.get("videos")
+    if isinstance(videos, dict):
+        video_list = videos.get("video_list")
+        if isinstance(video_list, dict):
+            for item in video_list.values():
+                add_candidate(item)
+
+    # Idea/video pins can move media metadata deeper in the response.
+    def walk(value: object) -> None:
+        if isinstance(value, dict):
+            add_candidate(value)
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    if not candidates:
+        walk(data.get("story_pin_data"))
+        walk(data.get("embed"))
+
+    if not candidates:
+        return None
+
+    best = max(candidates, key=lambda item: item[3])
+    return best[0], best[1], best[2]
+
+
 def _pin_photo_url(data: dict) -> str | None:
     # Never send a video's cover as if it were a photo pin.
-    if data.get("videos") or data.get("embed") or data.get("story_pin_data"):
+    if _pin_video_info(data) is not None or data.get("videos") or data.get("embed") or data.get("story_pin_data"):
         return None
+
     images = data.get("images") or {}
     candidates = [v for v in images.values() if isinstance(v, dict) and v.get("url")]
     if not candidates:
         raise DownloadError("В этом пине не найдено фото или видео.")
+
     original = images.get("orig")
     best = original if isinstance(original, dict) and original.get("url") else max(
-        candidates, key=lambda v: (v.get("width") or 0) * (v.get("height") or 0))
+        candidates, key=lambda v: (v.get("width") or 0) * (v.get("height") or 0)
+    )
     url = best["url"]
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
-    if parsed.scheme != "https" or not (host == "pinimg.com" or host.endswith(".pinimg.com")):
+    if parsed.scheme != "https" or not _is_pinimg_host(host):
         raise DownloadError("Неизвестный адрес изображения Pinterest.")
     return url
 
 
-def _download_pinterest_photo(url: str, work_dir: Path, max_upload_mb: int) -> DownloadResult | None:
+def _download_pinterest_media(
+    url: str,
+    work_dir: Path,
+    max_upload_mb: int,
+) -> DownloadResult | None:
     with httpx.Client(headers=DEFAULT_HEADERS, timeout=30, follow_redirects=False) as client:
         pin_id = _pinterest_pin_id(client, url)
         response = client.get(
@@ -821,21 +895,62 @@ def _download_pinterest_photo(url: str, work_dir: Path, max_upload_mb: int) -> D
             headers={"X-Pinterest-PWS-Handler": "www/[username].js"},
         )
         response.raise_for_status()
-        data = response.json()["resource_response"]["data"]
+
+        payload = response.json()
+        resource = payload.get("resource_response") if isinstance(payload, dict) else None
+        data = resource.get("data") if isinstance(resource, dict) else None
         if not isinstance(data, dict):
-            raise DownloadError("Пин недоступен.")
+            raise DownloadError("Пин Pinterest недоступен.")
+
+        author_data = data.get("closeup_attribution") or data.get("pinner") or {}
+        author = None
+        if isinstance(author_data, dict):
+            author = (
+                author_data.get("full_name")
+                or author_data.get("username")
+                or author_data.get("id")
+            )
+
+        video = _pin_video_info(data)
+        if video is not None:
+            video_url, width, height = video
+            target = work_dir / (pin_id + ".mp4")
+            size = _download_direct_media(client, video_url, target, max_upload_mb)
+            logger.info("Pinterest direct video selected: %sx%s", width, height)
+            return DownloadResult(
+                target,
+                str(data.get("title") or data.get("grid_title") or "Pinterest video")[:200],
+                str(author)[:100] if author else None,
+                "Pinterest",
+                url,
+                size,
+                work_dir,
+                width=width,
+                height=height,
+                source="pinterest-video",
+            )
+
         photo_url = _pin_photo_url(data)
         if photo_url is None:
+            # Metadata says this is a video/idea pin but exposes no direct MP4.
+            # Let yt-dlp try its extractor with the Pinterest-specific format selector.
             return None
+
         suffix = Path(urlparse(photo_url).path).suffix.lower()
         if suffix not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
             suffix = ".jpg"
         target = work_dir / (pin_id + suffix)
         size = _download_direct_media(client, photo_url, target, max_upload_mb)
-        author = (data.get("closeup_attribution") or {}).get("full_name")
-        return DownloadResult(target, str(data.get("title") or "Pinterest")[:200],
-                              author, "Pinterest", url, size, work_dir, source="pinterest-photo")
-
+        return DownloadResult(
+            target,
+            str(data.get("title") or data.get("grid_title") or "Pinterest")[:200],
+            str(author)[:100] if author else None,
+            "Pinterest",
+            url,
+            size,
+            work_dir,
+            source="pinterest-photo",
+        )
 
 def _prepare_telegram_video(source: Path, ffmpeg_location: str | None) -> Path:
     """Validate actual streams; produce H.264/yuv420p + AAC with faststart."""
