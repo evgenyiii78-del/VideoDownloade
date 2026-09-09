@@ -21,9 +21,15 @@ class MediaTests(unittest.TestCase):
             ('https://m.youtube.com/watch?v=abc&list=xyz', 'YouTube'),
             ('https://pin.it/abc', 'Pinterest'),
             ('https://ru.pinterest.com/pin/123/', 'Pinterest'),
+            ('https://uk.pinterest.com/pin/204984220532938060/', 'Pinterest'),
+            ('https://fr.pinterest.com/pin/123/', 'Pinterest'),
         ]:
             self.assertEqual(extract_supported_url(url), (url, platform))
-        for url in ['https://youtube.com.evil.com/watch?v=x', 'https://pinterest.com@evil.com/pin/1']:
+        for url in [
+            'https://youtube.com.evil.com/watch?v=x',
+            'https://pinterest.com@evil.com/pin/1',
+            'https://uk.pinterest.com.evil.com/pin/1',
+        ]:
             with self.assertRaises(DownloadError):
                 extract_supported_url(url)
 
