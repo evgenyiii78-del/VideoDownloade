@@ -8,7 +8,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from downloader import (DownloadResult, DownloadError, FileTooLargeError,
                         extract_supported_url, _pin_photo_url, convert_to_mp3,
-                        download_audio, _download_with_ytdlp, _pinterest_pin_id)
+                        download_audio, download_video, _download_with_ytdlp,
+                        _pinterest_pin_id)
 
 
 class MediaTests(unittest.TestCase):
@@ -85,11 +86,26 @@ class MediaTests(unittest.TestCase):
                 self.assertEqual(opts['postprocessors'][0]['preferredcodec'], 'mp3')
                 self.assertEqual(result.path.suffix, '.mp3')
 
-    def test_instagram_audio_keeps_existing_download_path(self):
-        with patch('downloader.download_video') as video, patch('downloader.convert_to_mp3') as convert:
-            download_audio('https://instagram.com/reel/x', 'Instagram', Path('/tmp'), 49)
-            video.assert_called_once()
-            convert.assert_called_once_with(video.return_value, 49, None)
+    def test_social_audio_keeps_existing_download_path(self):
+        for url, platform in [
+            ('https://instagram.com/reel/x', 'Instagram'),
+            ('https://vt.tiktok.com/abc/', 'TikTok'),
+        ]:
+            with patch('downloader.download_video') as video, patch('downloader.convert_to_mp3') as convert:
+                download_audio(url, platform, Path('/tmp'), 49)
+                video.assert_called_once()
+                convert.assert_called_once_with(video.return_value, 49, None)
+
+    def test_tiktok_uses_fallback_when_ytdlp_is_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sentinel = Mock()
+            with patch('downloader._download_with_ytdlp', side_effect=RuntimeError('status code 0')), \
+                 patch('downloader._download_tiktok_via_tikwm', return_value=sentinel) as fallback:
+                result = download_video(
+                    'https://vt.tiktok.com/abc/', 'TikTok', Path(tmp), 49
+                )
+            self.assertIs(result, sentinel)
+            fallback.assert_called_once()
 
     def test_real_mp3_conversion_and_size_cleanup(self):
         with tempfile.TemporaryDirectory() as tmp:
