@@ -9,7 +9,8 @@ from unittest.mock import AsyncMock, Mock, patch
 from downloader import (DownloadResult, DownloadError, FileTooLargeError,
                         extract_supported_url, _pin_photo_url, convert_to_mp3,
                         download_audio, download_video, _download_with_ytdlp,
-                        _pinterest_pin_id, _is_tiktok_media_host)
+                        _pinterest_pin_id, _is_tiktok_media_host,
+                        _pin_video_info)
 
 
 class MediaTests(unittest.TestCase):
@@ -33,6 +34,46 @@ class MediaTests(unittest.TestCase):
         self.assertIsNone(_pin_photo_url(dict(data, videos={'video_list': {}})))
         with self.assertRaises(DownloadError):
             _pin_photo_url({'images': {'orig': {'url': 'https://evil.com/image.jpg'}}})
+
+    def test_pinterest_video_prefers_largest_direct_mp4(self):
+        data = {
+            'videos': {
+                'video_list': {
+                    'small': {
+                        'url': 'https://v.pinimg.com/videos/small.mp4',
+                        'width': 360,
+                        'height': 640,
+                    },
+                    'large': {
+                        'url': 'https://v.pinimg.com/videos/large.mp4',
+                        'width': 720,
+                        'height': 1280,
+                    },
+                    'hls': {
+                        'url': 'https://v.pinimg.com/videos/master.m3u8',
+                        'width': 1080,
+                        'height': 1920,
+                    },
+                },
+            },
+            'images': {
+                'orig': {'url': 'https://i.pinimg.com/originals/cover.jpg'},
+            },
+        }
+        url, width, height = _pin_video_info(data)
+        self.assertEqual(url, 'https://v.pinimg.com/videos/large.mp4')
+        self.assertEqual((width, height), (720, 1280))
+        self.assertIsNone(_pin_photo_url(data))
+
+    def test_pinterest_video_rejects_foreign_mp4(self):
+        data = {
+            'videos': {
+                'video_list': {
+                    'bad': {'url': 'https://evil.com/video.mp4', 'width': 720, 'height': 1280},
+                },
+            },
+        }
+        self.assertIsNone(_pin_video_info(data))
 
     def test_short_link_redirect_validation(self):
         client = Mock()
