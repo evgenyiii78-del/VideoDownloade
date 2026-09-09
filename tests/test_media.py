@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from downloader import (DownloadResult, DownloadError, FileTooLargeError,
                         extract_supported_url, _pin_photo_url, convert_to_mp3,
                         download_audio, download_video, _download_with_ytdlp,
-                        _pinterest_pin_id)
+                        _pinterest_pin_id, _is_tiktok_media_host)
 
 
 class MediaTests(unittest.TestCase):
@@ -106,6 +106,18 @@ class MediaTests(unittest.TestCase):
                 )
             self.assertIs(result, sentinel)
             fallback.assert_called_once()
+
+    def test_tiktok_media_host_validation(self):
+        for host in [
+            'v16-webapp-prime.tiktok.com',
+            'p16-sign.tiktokcdn.com',
+            'v16m-default.akamaized.net',
+            'video.byteoversea.com',
+            'cdn.tikwm.com',
+        ]:
+            self.assertTrue(_is_tiktok_media_host(host))
+        for host in ['evil.com', 'tiktok.com.evil.com', '127.0.0.1']:
+            self.assertFalse(_is_tiktok_media_host(host))
 
     def test_real_mp3_conversion_and_size_cleanup(self):
         with tempfile.TemporaryDirectory() as tmp:
