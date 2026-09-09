@@ -54,6 +54,7 @@ class Settings:
     max_concurrent_downloads: int
     cookies_file: Path | None
     ffmpeg_location: str | None
+    admin_id: int | None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -81,4 +82,7 @@ class Settings:
             max_concurrent_downloads=max(1, _int_env("MAX_CONCURRENT_DOWNLOADS", 3)),
             cookies_file=cookies_file,
             ffmpeg_location=ffmpeg_location,
+            admin_id=(lambda value: int(value) if value else None)(
+                os.getenv("ADMIN_ID", "").strip()
+            ),
         )
