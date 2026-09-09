@@ -60,6 +60,9 @@ INSTAGRAM_PROXY_HOSTS = (
     "ddinstagram.com",
 )
 
+TIKWM_API_URL = "https://www.tikwm.com/api/"
+TIKWM_BASE_URL = "https://www.tikwm.com"
+
 VIDEO_META_KEYS = {
     "og:video",
     "og:video:url",
@@ -415,6 +418,68 @@ def _download_instagram_via_proxy(
     raise DownloadError("Instagram proxy fallback failed: " + " | ".join(errors))
 
 
+def _download_tiktok_via_tikwm(
+    original_url: str,
+    work_dir: Path,
+    max_upload_mb: int,
+) -> DownloadResult:
+    with httpx.Client(
+        headers=DEFAULT_HEADERS,
+        follow_redirects=True,
+        timeout=httpx.Timeout(30.0, read=90.0),
+    ) as client:
+        response = client.post(
+            TIKWM_API_URL,
+            data={"url": original_url, "hd": "1"},
+        )
+        response.raise_for_status()
+
+        payload = response.json()
+        data = payload.get("data")
+        if payload.get("code") != 0 or not isinstance(data, dict):
+            raise DownloadError(
+                "TikWM не смог получить этот ролик TikTok."
+            )
+
+        media_path = data.get("hdplay") or data.get("play")
+        if not isinstance(media_path, str) or not media_path:
+            raise DownloadError("TikWM не вернул ссылку на видео.")
+
+        media_url = urljoin(TIKWM_BASE_URL + "/", media_path)
+        parsed = urlparse(media_url)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme != "https" or not (
+            host == "tikwm.com" or host.endswith(".tikwm.com")
+        ):
+            raise DownloadError("TikWM вернул неизвестный адрес видео.")
+
+        target = work_dir / "tiktok_tikwm.mp4"
+        size_bytes = _download_direct_media(
+            client, media_url, target, max_upload_mb
+        )
+
+        author_data = data.get("author") or {}
+        author = None
+        if isinstance(author_data, dict):
+            author = (
+                author_data.get("unique_id")
+                or author_data.get("nickname")
+            )
+
+        return DownloadResult(
+            path=target,
+            title=str(data.get("title") or "TikTok")[:200],
+            author=str(author)[:100] if author else None,
+            platform="TikTok",
+            webpage_url=original_url,
+            size_bytes=size_bytes,
+            work_dir=work_dir,
+            width=int(data["width"]) if data.get("width") else None,
+            height=int(data["height"]) if data.get("height") else None,
+            source="tikwm-fallback",
+        )
+
+
 def _clear_work_dir(work_dir: Path) -> None:
     for item in work_dir.iterdir():
         if item.is_file() or item.is_symlink():
@@ -469,6 +534,27 @@ def download_video(
             public_error = exc
             if platform == "Instagram":
                 logger.warning("Instagram public download failed: %s", exc)
+            elif platform == "TikTok":
+                logger.warning("TikTok yt-dlp download failed: %s", exc)
+
+        # TikTok fallback: TikTok frequently blocks datacenter IPs or changes
+        # its anti-bot challenge. TikWM gives us a second independent path.
+        if platform == "TikTok":
+            _clear_work_dir(work_dir)
+            try:
+                return _download_tiktok_via_tikwm(
+                    original_url=url,
+                    work_dir=work_dir,
+                    max_upload_mb=max_upload_mb,
+                )
+            except FileTooLargeError:
+                raise
+            except Exception as tikwm_exc:
+                logger.warning("TikTok TikWM fallback failed: %s", tikwm_exc)
+                raise DownloadError(
+                    f"TikTok yt-dlp download failed: {public_error}; "
+                    f"TikWM fallback failed: {tikwm_exc}"
+                ) from tikwm_exc
 
         # 2) Instagram only: retry with the bot's server-side service session.
         # Users never need to provide their own Instagram credentials.
@@ -572,7 +658,7 @@ def download_audio(url: str, platform: str, download_root: Path,
                    max_upload_mb: int, cookies_file: Path | None = None,
                    ffmpeg_location: str | None = None) -> DownloadResult:
     _ffmpeg_binary(ffmpeg_location)
-    if platform == "Instagram":
+    if platform in {"Instagram", "TikTok"}:
         result = download_video(url, platform, download_root, max_upload_mb,
                                 cookies_file, ffmpeg_location)
         return convert_to_mp3(result, max_upload_mb, ffmpeg_location)
