@@ -151,6 +151,20 @@ def extract_supported_url(text: str) -> tuple[str, str]:
         parsed = urlparse(raw_url)
         host = (parsed.hostname or "").lower().rstrip(".")
         platform = SUPPORTED_HOSTS.get(host)
+
+        # Pinterest uses many regional subdomains such as uk.pinterest.com,
+        # fr.pinterest.com, etc. Accept only real Pinterest domain suffixes,
+        # not lookalikes such as pinterest.com.evil.com.
+        if platform is None and (
+            host == "pinterest.com"
+            or host.endswith(".pinterest.com")
+            or host == "pinterest.ru"
+            or host.endswith(".pinterest.ru")
+            or host == "pinterest.de"
+            or host.endswith(".pinterest.de")
+        ):
+            platform = "Pinterest"
+
         if platform:
             return raw_url, platform
     raise UnsupportedUrlError("No supported video URL found")
