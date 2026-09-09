@@ -240,6 +240,10 @@ def _download_with_ytdlp_once(
                               f"bv[height<={max_height}]+ba/b[height<={max_height}]")
         ydl_opts["merge_output_format"] = "mp4"
         ydl_opts["js_runtimes"] = youtube_js_runtimes()
+    elif platform == "TikTok":
+        # TikTok increasingly rejects plain datacenter HTTP fingerprints.
+        # yt-dlp can use curl_cffi (installed via requirements extra) to mimic Chrome.
+        ydl_opts["impersonate"] = "chrome"
     if russian:
         ydl_opts["format"] = (
             f"bv[vcodec^=avc1][height<={max_height}]+ba[language^=ru]/"
@@ -418,6 +422,24 @@ def _download_instagram_via_proxy(
     raise DownloadError("Instagram proxy fallback failed: " + " | ".join(errors))
 
 
+def _is_tiktok_media_host(host: str) -> bool:
+    host = (host or "").lower().rstrip(".")
+    allowed_roots = (
+        "tiktok.com",
+        "tiktokcdn.com",
+        "tiktokcdn-us.com",
+        "tiktokcdn-eu.com",
+        "tiktokv.com",
+        "ibytedtos.com",
+        "byteoversea.com",
+        "muscdn.com",
+        "tikcdn.io",
+        "akamaized.net",
+        "tikwm.com",
+    )
+    return any(host == root or host.endswith("." + root) for root in allowed_roots)
+
+
 def _download_tiktok_via_tikwm(
     original_url: str,
     work_dir: Path,
@@ -448,10 +470,11 @@ def _download_tiktok_via_tikwm(
         media_url = urljoin(TIKWM_BASE_URL + "/", media_path)
         parsed = urlparse(media_url)
         host = (parsed.hostname or "").lower()
-        if parsed.scheme != "https" or not (
-            host == "tikwm.com" or host.endswith(".tikwm.com")
-        ):
-            raise DownloadError("TikWM вернул неизвестный адрес видео.")
+        if parsed.scheme != "https" or not _is_tiktok_media_host(host):
+            logger.warning("TikWM returned unrecognized media host: %s", host)
+            raise DownloadError(
+                f"TikWM вернул неизвестный адрес видео: {host or 'без домена'}."
+            )
 
         target = work_dir / "tiktok_tikwm.mp4"
         size_bytes = _download_direct_media(
