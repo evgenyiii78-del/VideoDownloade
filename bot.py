@@ -20,6 +20,7 @@ from downloader import (
     download_audio,
     extract_supported_url,
 )
+from user_registry import init_users_db, record_user, users_summary
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,6 +31,8 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("video_downloader_bot")
 
 SETTINGS = Settings.from_env()
+USERS_DB = SETTINGS.download_dir / "users.sqlite3"
+init_users_db(USERS_DB)
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(SETTINGS.max_concurrent_downloads)
 
 WELCOME = (
@@ -58,13 +61,73 @@ def remember_choice(user_id: int, chat_id: int, url: str, platform: str) -> str:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    record_user(USERS_DB, update.effective_user)
     if update.effective_message:
         await update.effective_message.reply_text(WELCOME)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    record_user(USERS_DB, update.effective_user)
     if update.effective_message:
         await update.effective_message.reply_text(WELCOME)
+
+
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+
+    record_user(USERS_DB, user)
+
+    if SETTINGS.admin_id is None:
+        await message.reply_text(
+            "⚙️ Команда /users отключена: добавьте ADMIN_ID в .env."
+        )
+        return
+
+    if user.id != SETTINGS.admin_id:
+        await message.reply_text("⛔ Нет доступа.")
+        return
+
+    total_users, total_requests, rows = users_summary(USERS_DB, limit=100)
+    header = (
+        f"👥 Пользователи бота: {total_users}\n"
+        f"📥 Скачиваний запрошено: {total_requests}\n"
+        f"Показаны последние: {len(rows)}\n\n"
+    )
+
+    lines = []
+    for index, row in enumerate(rows, 1):
+        username = f"@{row['username']}" if row.get("username") else "без username"
+        full_name = " ".join(
+            part for part in (row.get("first_name"), row.get("last_name")) if part
+        ).strip() or "без имени"
+        full_name = full_name.replace("\n", " ")[:60]
+        last_seen = str(row.get("last_seen") or "").replace("T", " ")[:16]
+        lines.append(
+            f"{index}. {username} | {full_name}\n"
+            f"ID: {row['user_id']} | 📥 {row['request_count']} | 🕒 {last_seen} UTC"
+        )
+
+    if not lines:
+        await message.reply_text(header + "Пока пользователей нет.")
+        return
+
+    chunks = []
+    current = header
+    for line in lines:
+        block = line + "\n\n"
+        if len(current) + len(block) > 3800:
+            chunks.append(current.rstrip())
+            current = block
+        else:
+            current += block
+    if current.strip():
+        chunks.append(current.rstrip())
+
+    for chunk in chunks:
+        await message.reply_text(chunk)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -75,9 +138,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         url, platform = extract_supported_url(message.text)
     except UnsupportedUrlError:
+        record_user(USERS_DB, update.effective_user)
         await message.reply_text("Пришлите ссылку на Instagram, TikTok, YouTube или Pinterest.")
         return
 
+    record_user(USERS_DB, update.effective_user, increment_requests=True)
     key = remember_choice(update.effective_user.id, message.chat_id, url, platform)
     await message.reply_text(
         f"{platform}: что скачать?",
@@ -238,6 +303,7 @@ def main() -> None:
     )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("users", users_command))
     app.add_handler(CallbackQueryHandler(handle_choice, pattern=r"^download:(video|audio|ruvideo|rusubs):[0-9a-f]{16}$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
