@@ -222,7 +222,7 @@ def _ffmpeg_for_telegram() -> str:
 
 
 def _normalize_instagram_video(source: Path) -> Path:
-    """Rewrite Instagram MP4 with square pixels so Telegram keeps aspect ratio."""
+    """Bake the source sample aspect ratio into pixels, then emit square pixels."""
     target = source.with_name(source.stem + ".aspect.mp4")
     binary = _ffmpeg_for_telegram()
 
@@ -255,7 +255,7 @@ def _normalize_instagram_video(source: Path) -> Path:
                 "-pix_fmt",
                 "yuv420p",
                 "-vf",
-                "scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1",
+                "scale=trunc(iw*sar/2)*2:trunc(ih/2)*2,setsar=1",
                 "-metadata:s:v:0",
                 "rotate=0",
                 "-c:a",
