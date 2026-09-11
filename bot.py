@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
+import shutil
+import subprocess
 import time
+from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
@@ -57,7 +61,6 @@ def remember_choice(user_id: int, chat_id: int, url: str, platform: str) -> str:
     key = secrets.token_hex(8)
     CHOICES[key] = (user_id, chat_id, url, platform, now)
     return key
-
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -202,6 +205,89 @@ def _cleanup_late_download(task):
             pass
 
 
+def _ffmpeg_for_telegram() -> str:
+    location = SETTINGS.ffmpeg_location
+    if location:
+        path = Path(location)
+        if path.is_dir():
+            path = path / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+        if path.is_file():
+            return str(path)
+
+    binary = shutil.which("ffmpeg")
+    if binary:
+        return binary
+
+    raise DownloadError("FFmpeg не найден на сервере.")
+
+
+def _normalize_instagram_video(source: Path) -> Path:
+    """Rewrite Instagram MP4 with square pixels so Telegram keeps aspect ratio."""
+    target = source.with_name(source.stem + ".aspect.mp4")
+    binary = _ffmpeg_for_telegram()
+
+    logger.info("Normalizing Instagram video aspect ratio: %s", source.name)
+
+    try:
+        subprocess.run(
+            [
+                binary,
+                "-nostdin",
+                "-y",
+                "-v",
+                "error",
+                "-i",
+                str(source),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
+                "-sn",
+                "-dn",
+                "-map_metadata",
+                "-1",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p",
+                "-vf",
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1",
+                "-metadata:s:v:0",
+                "rotate=0",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-movflags",
+                "+faststart",
+                str(target),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.exception("Instagram aspect normalization failed")
+        raise NoMediaFileError(
+            "Не удалось исправить пропорции Instagram-видео."
+        ) from exc
+
+    size_bytes = target.stat().st_size
+    size_mb = size_bytes / (1024 * 1024)
+    if size_mb > SETTINGS.max_upload_mb:
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        raise FileTooLargeError(size_mb, SETTINGS.max_upload_mb)
+
+    return target
+
+
 async def send_download(message, context, url: str, platform: str, mode: str) -> None:
     status = await message.reply_text("⏳ В очереди на скачивание…")
     task = None
@@ -226,7 +312,18 @@ async def send_download(message, context, url: str, platform: str, mode: str) ->
                 caption_lines.append(f"👤 {result.author}")
             caption = "\n".join(caption_lines)
 
-            with result.path.open("rb") as video_file:
+            send_path = result.path
+            if (
+                mode != "audio"
+                and result.platform == "Instagram"
+                and result.path.suffix.lower() == ".mp4"
+            ):
+                await status.edit_text("⏳ Исправляю пропорции Instagram-видео…")
+                send_path = await asyncio.to_thread(
+                    _normalize_instagram_video, result.path
+                )
+
+            with send_path.open("rb") as video_file:
                 if mode == "audio":
                     await message.reply_audio(
                         audio=video_file, title=result.title, performer=result.author,
@@ -241,9 +338,8 @@ async def send_download(message, context, url: str, platform: str, mode: str) ->
                         video_file.seek(0)
                         await message.reply_document(document=video_file, caption=caption,
                                                      read_timeout=180, write_timeout=180)
-                elif result.path.suffix.lower() == ".mp4":
-                    # Let Telegram read the real dimensions from the MP4 itself.
-                    # Passing yt-dlp/fallback metadata here can stretch vertical video.
+                elif send_path.suffix.lower() == ".mp4":
+                    # Telegram reads dimensions from the normalized MP4 itself.
                     await message.reply_video(
                         video=video_file,
                         caption=caption,
