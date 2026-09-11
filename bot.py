@@ -242,12 +242,12 @@ async def send_download(message, context, url: str, platform: str, mode: str) ->
                         await message.reply_document(document=video_file, caption=caption,
                                                      read_timeout=180, write_timeout=180)
                 elif result.path.suffix.lower() == ".mp4":
+                    # Let Telegram read the real dimensions from the MP4 itself.
+                    # Passing yt-dlp/fallback metadata here can stretch vertical video.
                     await message.reply_video(
                         video=video_file,
                         caption=caption,
                         supports_streaming=True,
-                        width=result.width,
-                        height=result.height,
                         read_timeout=180,
                         write_timeout=180,
                         connect_timeout=30,
