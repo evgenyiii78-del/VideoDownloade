@@ -261,7 +261,19 @@ async def send_download(message, context, url: str, platform: str, mode: str) ->
                         await message.reply_document(document=video_file, caption=caption,
                                                      read_timeout=180, write_timeout=180)
                 elif result.path.suffix.lower() == ".mp4":
-                    # Send the downloaded MP4 as-is. Telegram reads the real frame size.
+                    video_kwargs = {}
+                    if (
+                        result.source.startswith("instagram-original")
+                        and result.width
+                        and result.height
+                    ):
+                        video_kwargs["width"] = result.width
+                        video_kwargs["height"] = result.height
+                        logger.info(
+                            "Sending Instagram video with explicit Telegram dimensions: %sx%s",
+                            result.width,
+                            result.height,
+                        )
                     await message.reply_video(
                         video=video_file,
                         caption=caption,
@@ -270,6 +282,7 @@ async def send_download(message, context, url: str, platform: str, mode: str) ->
                         write_timeout=180,
                         connect_timeout=30,
                         pool_timeout=30,
+                        **video_kwargs,
                     )
                 else:
                     await message.reply_document(
