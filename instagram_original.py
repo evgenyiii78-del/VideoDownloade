@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import subprocess
 import uuid
 from pathlib import Path
 
@@ -13,11 +14,106 @@ from downloader import (
     DownloadResult,
     FileTooLargeError,
     _check_size,
+    _ffmpeg_binary,
     _pick_output_file,
 )
 from media_runtime import resolve_ffmpeg
 
 logger = logging.getLogger("video_downloader_bot.instagram_original")
+
+
+def _prepare_native_for_telegram(
+    source: Path,
+    info: dict,
+    work_dir: Path,
+    max_upload_mb: int,
+    ffmpeg_location: str | None,
+) -> Path:
+    """Keep Instagram's selected frame geometry; only fix codec/container if needed."""
+    vcodec = str(info.get("vcodec") or "").lower()
+    acodec = str(info.get("acodec") or "").lower()
+
+    video_is_h264 = vcodec.startswith("h264") or vcodec.startswith("avc1")
+    audio_is_aac = (
+        not acodec
+        or acodec == "none"
+        or acodec.startswith("aac")
+        or acodec.startswith("mp4a")
+    )
+
+    # If Instagram already supplied a Telegram-friendly MP4, do not touch it.
+    if source.suffix.lower() == ".mp4" and video_is_h264 and audio_is_aac:
+        logger.info(
+            "Instagram native MP4 kept unchanged: %sx%s codec=%s/%s",
+            info.get("width"),
+            info.get("height"),
+            vcodec or "unknown",
+            acodec or "unknown",
+        )
+        return source
+
+    binary = _ffmpeg_binary(ffmpeg_location)
+    target = work_dir / "instagram_native.telegram.mp4"
+
+    args = [
+        binary,
+        "-nostdin",
+        "-y",
+        "-v",
+        "error",
+        "-i",
+        str(source),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-sn",
+        "-dn",
+    ]
+
+    # Never scale, crop or change SAR here. We keep the selected Instagram
+    # rendition's frame geometry exactly as delivered by Instagram.
+    if video_is_h264:
+        args += ["-c:v", "copy"]
+    else:
+        args += [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+        ]
+
+    if not acodec or acodec == "none":
+        pass
+    elif audio_is_aac:
+        args += ["-c:a", "copy"]
+    else:
+        args += ["-c:a", "aac", "-b:a", "128k"]
+
+    args += ["-movflags", "+faststart", str(target)]
+
+    logger.info(
+        "Instagram native stream packaging: %sx%s aspect=%s video=%s audio=%s",
+        info.get("width"),
+        info.get("height"),
+        info.get("aspect_ratio"),
+        "copy" if video_is_h264 else "h264 convert",
+        "none" if not acodec or acodec == "none" else ("copy" if audio_is_aac else "aac convert"),
+    )
+
+    try:
+        subprocess.run(args, check=True, capture_output=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DownloadError(
+            "Не удалось упаковать исходный поток Instagram в MP4."
+        ) from exc
+
+    _check_size(target, max_upload_mb)
+    return target
 
 
 def _download_once(
@@ -28,12 +124,15 @@ def _download_once(
     ffmpeg_location: str | None,
     source: str,
 ) -> DownloadResult:
-    """Download Instagram's best native video stream without resizing/re-encoding."""
+    """Download Instagram's best native reel rendition without resizing/cropping."""
     opts: dict = {
-        # Prefer the highest quality native MP4 video + M4A audio streams.
-        # FFmpeg only muxes them together; it does not scale or re-encode video.
-        "format": "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b",
-        "merge_output_format": "mp4",
+        # Reels often expose both square/progressive MP4 and portrait DASH
+        # renditions. Prefer a portrait rendition when Instagram provides one,
+        # then fall back to the best native stream of any aspect ratio.
+        "format": "bv*[aspect_ratio<1]+ba/b[aspect_ratio<1]/bv*+ba/b",
+        # DASH may use VP9/other codecs. Merge losslessly first; below we only
+        # convert codecs/container when Telegram requires it, never geometry.
+        "merge_output_format": "mkv",
         "outtmpl": str(work_dir / "%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
@@ -66,16 +165,29 @@ def _download_once(
         raise DownloadError("Instagram не вернул данные видео.")
 
     output = _pick_output_file(work_dir, info)
+
+    logger.info(
+        "Instagram native format selected: id=%s %sx%s aspect=%s vcodec=%s acodec=%s file=%s",
+        info.get("format_id"),
+        info.get("width"),
+        info.get("height"),
+        info.get("aspect_ratio"),
+        info.get("vcodec"),
+        info.get("acodec"),
+        output.name,
+    )
+
+    output = _prepare_native_for_telegram(
+        output,
+        info,
+        work_dir,
+        max_upload_mb,
+        ffmpeg_location,
+    )
     size_bytes = _check_size(output, max_upload_mb)
 
     width = int(info["width"]) if info.get("width") else None
     height = int(info["height"]) if info.get("height") else None
-    logger.info(
-        "Instagram native stream selected: %sx%s file=%s",
-        width,
-        height,
-        output.name,
-    )
 
     title = str(info.get("title") or info.get("description") or "Instagram video")
     author = info.get("uploader") or info.get("creator") or info.get("channel")
@@ -101,7 +213,7 @@ def download_instagram_original(
     cookies_file: Path | None = None,
     ffmpeg_location: str | None = None,
 ) -> DownloadResult:
-    """Get the native Instagram rendition, keeping its original frame geometry."""
+    """Get Instagram's own reel rendition while preserving its native geometry."""
     work_dir = download_root / uuid.uuid4().hex
     work_dir.mkdir(parents=True, exist_ok=False)
 
