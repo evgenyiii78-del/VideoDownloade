@@ -40,6 +40,7 @@ WELCOME = (
     "🎬 Отправьте ссылку на ролик из Instagram, TikTok, YouTube или Pinterest.\n\n"
     "Поддерживаются YouTube Shorts и короткие ссылки youtu.be / pin.it.\n"
     "После ссылки выберите: 🎬 Видео или 🎵 MP3.\n"
+    "Instagram: дополнительно доступен 📦 Оригинал — файл без обработки Telegram-плеером.\n"
     "Для YouTube также доступны русская аудиодорожка и субтитры.\n"
     "Pinterest: фото и видеопины.\n\n"
     "Скачивайте материалы, которые вы имеете право сохранять."
@@ -144,15 +145,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     record_user(USERS_DB, update.effective_user, increment_requests=True)
     key = remember_choice(update.effective_user.id, message.chat_id, url, platform)
-    await message.reply_text(
-        f"{platform}: что скачать?",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🖼 Фото / видео" if platform == "Pinterest" else "🎬 Видео", callback_data=f"download:video:{key}"),
-            InlineKeyboardButton("🎵 MP3", callback_data=f"download:audio:{key}"),
-        ]] + ([[
+
+    rows = [[
+        InlineKeyboardButton(
+            "🖼 Фото / видео" if platform == "Pinterest" else "🎬 Видео",
+            callback_data=f"download:video:{key}",
+        ),
+        InlineKeyboardButton("🎵 MP3", callback_data=f"download:audio:{key}"),
+    ]]
+
+    if platform == "Instagram":
+        rows.append([
+            InlineKeyboardButton(
+                "📦 Оригинал",
+                callback_data=f"download:original:{key}",
+            )
+        ])
+
+    if platform == "YouTube":
+        rows.append([
             InlineKeyboardButton("🇷🇺 Русская дорожка", callback_data=f"download:ruvideo:{key}"),
             InlineKeyboardButton("📝 Русские субтитры", callback_data=f"download:rusubs:{key}"),
-        ]] if platform == "YouTube" else [])),
+        ])
+
+    await message.reply_text(
+        f"{platform}: что скачать?",
+        reply_markup=InlineKeyboardMarkup(rows),
     )
 
 
@@ -188,7 +206,7 @@ async def _download(url: str, platform: str, mode: str):
                 SETTINGS.cookies_file, SETTINGS.ffmpeg_location, subtitles=mode == "rusubs",
             )
 
-        if platform == "Instagram" and mode == "video":
+        if platform == "Instagram" and mode in {"video", "original"}:
             try:
                 return await asyncio.to_thread(
                     download_instagram_original,
@@ -201,6 +219,8 @@ async def _download(url: str, platform: str, mode: str):
             except FileTooLargeError:
                 raise
             except Exception as exc:
+                if mode == "original":
+                    raise
                 logger.warning(
                     "Instagram native stream failed; falling back to regular downloader: %s",
                     exc,
@@ -226,14 +246,21 @@ async def send_download(message, context, url: str, platform: str, mode: str) ->
     task = None
 
     try:
-        label = {"audio": "MP3", "ruvideo": "видео с русской дорожкой", "rusubs": "русские субтитры"}.get(mode, "видео")
+        label = {
+            "audio": "MP3",
+            "original": "оригинальный файл",
+            "ruvideo": "видео с русской дорожкой",
+            "rusubs": "русские субтитры",
+        }.get(mode, "видео")
         await status.edit_text(f"⏳ Готовлю {label} из {platform}…")
         task = asyncio.create_task(_download(url, platform, mode))
         result = await asyncio.wait_for(asyncio.shield(task), timeout=300)
 
         try:
             caption_lines = [f"✅ {result.platform}"]
-            if mode == "ruvideo":
+            if mode == "original":
+                caption_lines.append("📦 Оригинальный файл без обработки Telegram-плеером")
+            elif mode == "ruvideo":
                 caption_lines.append("🇷🇺 Русская аудиодорожка YouTube")
             elif mode == "rusubs":
                 caption_lines.append("📝 Русские субтитры — отдельный файл")
@@ -251,6 +278,23 @@ async def send_download(message, context, url: str, platform: str, mode: str) ->
                         audio=video_file, title=result.title, performer=result.author,
                         caption=caption, read_timeout=180, write_timeout=180,
                         connect_timeout=30, pool_timeout=30,
+                    )
+                elif mode == "original":
+                    logger.info(
+                        "Sending Instagram original as document: %s (%sx%s)",
+                        result.path.name,
+                        result.width,
+                        result.height,
+                    )
+                    await message.reply_document(
+                        document=video_file,
+                        filename=f"instagram_original{result.path.suffix or '.mp4'}",
+                        caption=caption,
+                        disable_content_type_detection=True,
+                        read_timeout=180,
+                        write_timeout=180,
+                        connect_timeout=30,
+                        pool_timeout=30,
                     )
                 elif result.source == "pinterest-photo":
                     try:
@@ -335,7 +379,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("users", users_command))
-    app.add_handler(CallbackQueryHandler(handle_choice, pattern=r"^download:(video|audio|ruvideo|rusubs):[0-9a-f]{16}$"))
+    app.add_handler(CallbackQueryHandler(handle_choice, pattern=r"^download:(video|audio|original|ruvideo|rusubs):[0-9a-f]{16}$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
 
