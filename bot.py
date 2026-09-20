@@ -17,6 +17,7 @@ from downloader import (
     FileTooLargeError,
     UnsupportedUrlError,
     download_video,
+    download_youtube_original,
     download_audio,
     extract_supported_url,
 )
@@ -154,7 +155,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         InlineKeyboardButton("🎵 MP3", callback_data=f"download:audio:{key}"),
     ]]
 
-    if platform == "Instagram":
+    if platform in {"Instagram", "YouTube"}:
         rows.append([
             InlineKeyboardButton(
                 "📦 Оригинал",
@@ -200,6 +201,11 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def _download(url: str, platform: str, mode: str):
     async with DOWNLOAD_SEMAPHORE:
+        if platform == "YouTube" and mode == "original":
+            return await asyncio.to_thread(
+                download_youtube_original, url, SETTINGS.download_dir, SETTINGS.max_upload_mb,
+                SETTINGS.cookies_file, SETTINGS.ffmpeg_location,
+            )
         if mode in {"ruvideo", "rusubs"}:
             return await asyncio.to_thread(
                 download_russian, url, platform, SETTINGS.download_dir, SETTINGS.max_upload_mb,
@@ -281,14 +287,14 @@ async def send_download(message, context, url: str, platform: str, mode: str) ->
                     )
                 elif mode == "original":
                     logger.info(
-                        "Sending Instagram original as document: %s (%sx%s)",
+                        "Sending original as document: %s (%sx%s)",
                         result.path.name,
                         result.width,
                         result.height,
                     )
                     await message.reply_document(
                         document=video_file,
-                        filename=f"instagram_original{result.path.suffix or '.mp4'}",
+                        filename=f"{result.platform.lower()}_original{result.path.suffix or '.mp4'}",
                         caption=caption,
                         disable_content_type_detection=True,
                         read_timeout=180,
@@ -307,14 +313,14 @@ async def send_download(message, context, url: str, platform: str, mode: str) ->
                 elif result.path.suffix.lower() == ".mp4":
                     video_kwargs = {}
                     if (
-                        result.source.startswith("instagram-original")
+                        (result.source.startswith("instagram-original") or result.platform == "YouTube")
                         and result.width
                         and result.height
                     ):
                         video_kwargs["width"] = result.width
                         video_kwargs["height"] = result.height
                         logger.info(
-                            "Sending Instagram video with explicit Telegram dimensions: %sx%s",
+                            "Sending video with explicit Telegram dimensions: %sx%s",
                             result.width,
                             result.height,
                         )
@@ -350,7 +356,7 @@ async def send_download(message, context, url: str, platform: str, mode: str) ->
         logger.info("Video too large: %.1f MB", exc.size_mb)
         await status.edit_text(
             f"⚠️ Файл весит {exc.size_mb:.1f} МБ и превышает установленный лимит "
-            f"{exc.limit_mb} МБ."
+            f"{exc.limit_mb} МБ. Исходное разрешение сохранено; автоматическое уменьшение отключено."
         )
     except NoMediaFileError as exc:
         await status.edit_text(f"❌ {exc}")

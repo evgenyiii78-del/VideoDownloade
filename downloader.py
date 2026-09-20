@@ -229,6 +229,7 @@ def _download_with_ytdlp_once(
     audio: bool = False,
     max_height: int = 720,
     russian: bool = False,
+    original: bool = False,
 ) -> DownloadResult:
     download_log = _DownloadLogger(max_upload_mb)
     ydl_opts: dict = {
@@ -249,10 +250,9 @@ def _download_with_ytdlp_once(
 
     if platform == "YouTube":
         # YouTube usually supplies separate audio/video streams.
-        ydl_opts["format"] = (f"bv[vcodec^=avc1][height<={max_height}]+ba[acodec^=mp4a]/"
-                              f"b[vcodec^=avc1][acodec^=mp4a][height<={max_height}]/"
-                              f"bv[height<={max_height}]+ba/b[height<={max_height}]")
-        ydl_opts["merge_output_format"] = "mp4"
+        ydl_opts["format"] = "bv+ba/b"
+        ydl_opts["format_sort"] = ["res", "fps", "vcodec:h264", "acodec:aac"]
+        ydl_opts["merge_output_format"] = "mkv"
         ydl_opts["js_runtimes"] = youtube_js_runtimes()
     elif platform == "TikTok":
         # TikTok increasingly rejects plain datacenter HTTP fingerprints.
@@ -265,12 +265,7 @@ def _download_with_ytdlp_once(
         ydl_opts["format"] = "bv*+ba/b"
         ydl_opts["merge_output_format"] = "mp4"
     if russian:
-        ydl_opts["format"] = (
-            f"bv[vcodec^=avc1][height<={max_height}]+ba[language^=ru]/"
-            f"b[vcodec^=avc1][language^=ru][height<={max_height}]/"
-            f"bv[height<={max_height}]+ba[language^=ru]/"
-            f"b[language^=ru][height<={max_height}]"
-        )
+        ydl_opts["format"] = "bv+ba[language^=ru]/b[language^=ru]"
     if audio:
         ydl_opts["format"] = "bestaudio/best"
         ydl_opts["postprocessors"] = [{
@@ -301,8 +296,12 @@ def _download_with_ytdlp_once(
         output = outputs[0]
     else:
         output = _pick_output_file(work_dir, info)
+    width = int(info["width"]) if info.get("width") else None
+    height = int(info["height"]) if info.get("height") else None
     if platform == "YouTube" and not audio:
-        output = _prepare_telegram_video(output, effective_ffmpeg)
+        if not original:
+            output = _prepare_telegram_video(output, effective_ffmpeg)
+        width, height = _video_display_dimensions(output, effective_ffmpeg)
     size_bytes = _check_size(output, max_upload_mb)
 
     title = str(info.get("title") or info.get("description") or "Видео")
@@ -316,31 +315,20 @@ def _download_with_ytdlp_once(
         webpage_url=str(info.get("webpage_url") or url),
         size_bytes=size_bytes,
         work_dir=work_dir,
-        width=int(info["width"]) if info.get("width") else None,
-        height=int(info["height"]) if info.get("height") else None,
+        width=width,
+        height=height,
         source=source_label,
     )
 
 
 def _download_with_ytdlp(url, platform, work_dir, max_upload_mb, cookies_file,
-                         ffmpeg_location, source_label="yt-dlp", audio=False, russian=False):
-    heights = (720, 480, 360, 240) if platform == "YouTube" and not audio else (720,)
-    size_error = None
-    for height in heights:
-        try:
-            return _download_with_ytdlp_once(
-                url, platform, work_dir, max_upload_mb, cookies_file,
-                ffmpeg_location, source_label, audio, max_height=height, russian=russian,
-            )
-        except FileTooLargeError as exc:
-            size_error = exc
-            logger.info('File exceeds %s MB at %sp; trying smaller format', max_upload_mb, height)
-            _clear_work_dir(work_dir)
-        except yt_dlp.utils.DownloadError as exc:
-            if size_error is None or 'Requested format is not available' not in str(exc):
-                raise
-            _clear_work_dir(work_dir)
-    raise size_error
+                         ffmpeg_location, source_label="yt-dlp", audio=False, russian=False,
+                         original=False):
+    # Never silently reduce the user's requested source resolution.
+    return _download_with_ytdlp_once(
+        url, platform, work_dir, max_upload_mb, cookies_file, ffmpeg_location,
+        source_label, audio, russian=russian, original=original,
+    )
 
 
 def _extract_proxy_media(client: httpx.Client, proxy_url: str) -> tuple[str, str, str | None]:
@@ -987,7 +975,7 @@ def _prepare_telegram_video(source: Path, ffmpeg_location: str | None) -> Path:
             args += ['-c:v', 'copy']
         else:
             args += ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '25',
-                     '-pix_fmt', 'yuv420p', '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2']
+                     '-pix_fmt', 'yuv420p']
         args += ['-c:a', 'copy'] if compatible_audio else ['-c:a', 'aac', '-b:a', '128k']
         args += ['-movflags', '+faststart', str(target)]
         logger.info('Preparing Telegram MP4: video=%s audio=%s',
@@ -999,3 +987,34 @@ def _prepare_telegram_video(source: Path, ffmpeg_location: str | None) -> Path:
         raise
     except (OSError, subprocess.SubprocessError) as exc:
         raise NoMediaFileError('Не удалось подготовить совместимое видео для Telegram. Попробуйте более короткий ролик.') from exc
+
+
+def _video_display_dimensions(path: Path, ffmpeg_location: str | None) -> tuple[int, int]:
+    probe = subprocess.run(
+        [_ffmpeg_binary(ffmpeg_location), '-nostdin', '-hide_banner', '-i', str(path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    video = re.search(r'Stream[^\n]*Video: ([^\n]+)', probe.stderr)
+    size = re.search(r'(?<![\w])([1-9]\d*)x([1-9]\d*)(?![\w])', video.group(1)) if video else None
+    if size is None:
+        raise NoMediaFileError('Не удалось определить размеры готового видео. Файл не отправлен.')
+    width, height = map(int, size.groups())
+    dar = re.search(r'DAR (\d+):(\d+)', video.group(1))
+    if dar and int(dar.group(2)):
+        width = round(height * int(dar.group(1)) / int(dar.group(2)))
+    rotation = re.search(r'rotation of (-?[\d.]+) degrees', probe.stderr)
+    if rotation and round(float(rotation.group(1))) % 180 == 90:
+        width, height = height, width
+    logger.info('YouTube output display dimensions: %sx%s', width, height)
+    return width, height
+
+
+def download_youtube_original(url, root, limit, cookies=None, ffmpeg=None):
+    work = root / uuid.uuid4().hex
+    work.mkdir(parents=True)
+    try:
+        return _download_with_ytdlp(url, 'YouTube', work, limit, None, ffmpeg,
+                                   source_label='youtube-original', original=True)
+    except Exception:
+        shutil.rmtree(work, ignore_errors=True)
+        raise
