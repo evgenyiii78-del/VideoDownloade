@@ -10,6 +10,7 @@ from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from config import Settings
+from youtube_fit import download_youtube_fit
 from russian import download_russian
 from downloader import (
     DownloadError,
@@ -164,6 +165,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         ])
 
     if platform == "YouTube":
+        rows.append([InlineKeyboardButton(f"📉 Уместить в {SETTINGS.max_upload_mb} МБ", callback_data=f"download:fit:{key}")])
         rows.append([
             InlineKeyboardButton("🇷🇺 Русская дорожка", callback_data=f"download:ruvideo:{key}"),
             InlineKeyboardButton("📝 Русские субтитры", callback_data=f"download:rusubs:{key}"),
@@ -201,6 +203,11 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def _download(url: str, platform: str, mode: str):
     async with DOWNLOAD_SEMAPHORE:
+        if platform == "YouTube" and mode == "fit":
+            return await asyncio.to_thread(
+                download_youtube_fit, url, SETTINGS.download_dir, SETTINGS.max_upload_mb,
+                SETTINGS.cookies_file, SETTINGS.ffmpeg_location,
+            )
         if platform == "YouTube" and mode == "original":
             return await asyncio.to_thread(
                 download_youtube_original, url, SETTINGS.download_dir, SETTINGS.max_upload_mb,
@@ -255,15 +262,18 @@ async def send_download(message, context, url: str, platform: str, mode: str) ->
         label = {
             "audio": "MP3",
             "original": "оригинальный файл",
+            "fit": "видео под лимит размера — без изменения пропорций",
             "ruvideo": "видео с русской дорожкой",
             "rusubs": "русские субтитры",
         }.get(mode, "видео")
         await status.edit_text(f"⏳ Готовлю {label} из {platform}…")
         task = asyncio.create_task(_download(url, platform, mode))
-        result = await asyncio.wait_for(asyncio.shield(task), timeout=300)
+        result = await asyncio.wait_for(asyncio.shield(task), timeout=900 if mode == "fit" else 300)
 
         try:
             caption_lines = [f"✅ {result.platform}"]
+            if mode == "fit":
+                caption_lines.append("Сжат битрейт; разрешение и пропорции сохранены")
             if mode == "original":
                 caption_lines.append("📦 Оригинальный файл без обработки Telegram-плеером")
             elif mode == "ruvideo":
@@ -351,12 +361,13 @@ async def send_download(message, context, url: str, platform: str, mode: str) ->
         if task is not None:
             task.add_done_callback(_cleanup_late_download)
         logger.warning("Download timed out for %s", url)
-        await status.edit_text("⏱ Не удалось скачать файл за 5 минут. Попробуйте ещё раз или другую ссылку.")
+        await status.edit_text("⏱ Обработка не завершилась за отведённое время. Попробуйте более короткий ролик.")
     except FileTooLargeError as exc:
         logger.info("Video too large: %.1f MB", exc.size_mb)
         await status.edit_text(
             f"⚠️ Файл весит {exc.size_mb:.1f} МБ и превышает установленный лимит "
-            f"{exc.limit_mb} МБ. Исходное разрешение сохранено; автоматическое уменьшение отключено."
+            f"{exc.limit_mb} МБ."
+            + (f" Нажмите «Уместить в {SETTINGS.max_upload_mb} МБ»: бот сожмёт битрейт, сохранив пропорции." if platform == "YouTube" and mode != "fit" else "")
         )
     except NoMediaFileError as exc:
         await status.edit_text(f"❌ {exc}")
@@ -385,7 +396,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("users", users_command))
-    app.add_handler(CallbackQueryHandler(handle_choice, pattern=r"^download:(video|audio|original|ruvideo|rusubs):[0-9a-f]{16}$"))
+    app.add_handler(CallbackQueryHandler(handle_choice, pattern=r"^download:(video|audio|original|fit|ruvideo|rusubs):[0-9a-f]{16}$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
 
