@@ -55,6 +55,13 @@ class Settings:
     cookies_file: Path | None
     ffmpeg_location: str | None
     admin_id: int | None
+    yandex_disk_token: str = ""
+    yandex_disk_folder: str = "VideoDownloaderBot"
+    max_download_mb: int = 512
+
+    @property
+    def download_limit_mb(self) -> int:
+        return max(self.max_upload_mb, self.max_download_mb) if self.yandex_disk_token else self.max_upload_mb
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -82,6 +89,9 @@ class Settings:
             max_concurrent_downloads=max(1, _int_env("MAX_CONCURRENT_DOWNLOADS", 3)),
             cookies_file=cookies_file,
             ffmpeg_location=ffmpeg_location,
+            yandex_disk_token=os.getenv("YANDEX_DISK_TOKEN", "").strip(),
+            yandex_disk_folder=os.getenv("YANDEX_DISK_FOLDER", "VideoDownloaderBot").strip(),
+            max_download_mb=max(1, _int_env("MAX_DOWNLOAD_MB", 512)),
             admin_id=(lambda value: int(value) if value else None)(
                 os.getenv("ADMIN_ID", "").strip()
             ),

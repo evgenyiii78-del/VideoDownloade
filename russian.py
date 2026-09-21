@@ -24,7 +24,7 @@ def russian_subtitles(info):
     return None
 
 
-def download_russian(url, platform, root, limit, cookies=None, ffmpeg=None, *, subtitles=False):
+def download_russian(url, platform, root, limit, cookies=None, ffmpeg=None, *, subtitles=False, telegram_limit_mb=None):
     if platform != 'YouTube':
         raise NoMediaFileError('Поиск русских дорожек доступен для YouTube.')
     work = root / uuid.uuid4().hex
@@ -33,7 +33,8 @@ def download_russian(url, platform, root, limit, cookies=None, ffmpeg=None, *, s
         if not subtitles:
             try:
                 return _download_with_ytdlp(url, platform, work, limit, None, ffmpeg,
-                                           source_label='youtube-russian-audio', russian=True)
+                                           source_label='youtube-russian-audio', russian=True,
+                                           telegram_limit_mb=telegram_limit_mb)
             except yt_dlp.utils.DownloadError as exc:
                 if 'Requested format is not available' in str(exc):
                     raise NoMediaFileError('Доступная русская аудиодорожка не найдена. Можно попробовать русские субтитры.') from exc

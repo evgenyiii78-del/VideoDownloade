@@ -230,10 +230,16 @@ def _download_with_ytdlp_once(
     max_height: int = 720,
     russian: bool = False,
     original: bool = False,
+    telegram_limit_mb: int | None = None,
 ) -> DownloadResult:
     download_log = _DownloadLogger(max_upload_mb)
+    def enforce_download_limit(progress):
+        downloaded = progress.get("downloaded_bytes") or 0
+        if downloaded > max_upload_mb * 1024 * 1024:
+            raise FileTooLargeError(downloaded / (1024 * 1024), max_upload_mb)
     ydl_opts: dict = {
         "logger": download_log,
+        "progress_hooks": [enforce_download_limit],
         # Prefer a ready-to-send single MP4 file so hosting without FFmpeg still works.
         "format": "b[ext=mp4]/b",
         "outtmpl": str(work_dir / "%(id)s.%(ext)s"),
@@ -298,8 +304,9 @@ def _download_with_ytdlp_once(
         output = _pick_output_file(work_dir, info)
     width = int(info["width"]) if info.get("width") else None
     height = int(info["height"]) if info.get("height") else None
+    _check_size(output, max_upload_mb)
     if platform == "YouTube" and not audio:
-        if not original:
+        if not original and (telegram_limit_mb is None or output.stat().st_size <= telegram_limit_mb * 1024 * 1024):
             output = _prepare_telegram_video(output, effective_ffmpeg)
         width, height = _video_display_dimensions(output, effective_ffmpeg)
     size_bytes = _check_size(output, max_upload_mb)
@@ -323,11 +330,11 @@ def _download_with_ytdlp_once(
 
 def _download_with_ytdlp(url, platform, work_dir, max_upload_mb, cookies_file,
                          ffmpeg_location, source_label="yt-dlp", audio=False, russian=False,
-                         original=False):
+                         original=False, telegram_limit_mb=None):
     # Never silently reduce the user's requested source resolution.
     return _download_with_ytdlp_once(
         url, platform, work_dir, max_upload_mb, cookies_file, ffmpeg_location,
-        source_label, audio, russian=russian, original=original,
+        source_label, audio, russian=russian, original=original, telegram_limit_mb=telegram_limit_mb,
     )
 
 
@@ -1009,12 +1016,13 @@ def _video_display_dimensions(path: Path, ffmpeg_location: str | None) -> tuple[
     return width, height
 
 
-def download_youtube_original(url, root, limit, cookies=None, ffmpeg=None):
+def download_youtube_original(url, root, limit, cookies=None, ffmpeg=None, *, telegram_limit_mb=None):
     work = root / uuid.uuid4().hex
     work.mkdir(parents=True)
     try:
         return _download_with_ytdlp(url, 'YouTube', work, limit, None, ffmpeg,
-                                   source_label='youtube-original', original=True)
+                                   source_label='youtube-original', original=telegram_limit_mb is None,
+                                   telegram_limit_mb=telegram_limit_mb)
     except Exception:
         shutil.rmtree(work, ignore_errors=True)
         raise

@@ -10,7 +10,7 @@ from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from config import Settings
-from youtube_fit import download_youtube_fit
+from yandex_disk import DiskError, upload_file
 from russian import download_russian
 from downloader import (
     DownloadError,
@@ -37,6 +37,7 @@ SETTINGS = Settings.from_env()
 USERS_DB = SETTINGS.download_dir / "users.sqlite3"
 init_users_db(USERS_DB)
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(SETTINGS.max_concurrent_downloads)
+DISK_SEMAPHORE = asyncio.Semaphore(1)
 
 WELCOME = (
     "🎬 Отправьте ссылку на ролик из Instagram, TikTok, YouTube или Pinterest.\n\n"
@@ -45,6 +46,7 @@ WELCOME = (
     "Instagram: дополнительно доступен 📦 Оригинал — файл без обработки Telegram-плеером.\n"
     "Для YouTube также доступны русская аудиодорожка и субтитры.\n"
     "Pinterest: фото и видеопины.\n\n"
+    "Большие файлы отправляются ссылкой на Яндекс Диск, если он подключён администратором.\n"
     "Скачивайте материалы, которые вы имеете право сохранять."
 )
 CHOICES: dict[str, tuple[int, int, str, str, float]] = {}
@@ -165,7 +167,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         ])
 
     if platform == "YouTube":
-        rows.append([InlineKeyboardButton(f"📉 Уместить в {SETTINGS.max_upload_mb} МБ", callback_data=f"download:fit:{key}")])
         rows.append([
             InlineKeyboardButton("🇷🇺 Русская дорожка", callback_data=f"download:ruvideo:{key}"),
             InlineKeyboardButton("📝 Русские субтитры", callback_data=f"download:rusubs:{key}"),
@@ -182,6 +183,9 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if query is None or query.message is None:
         return
     _, mode, key = query.data.split(":", 2)
+    if mode == "fit":
+        await query.answer("Сжатие отключено. Пришлите ссылку заново: большие файлы отправляются на Яндекс Диск.", show_alert=True)
+        return
     choice = CHOICES.get(key)
     if choice is None or time.monotonic() - choice[4] > 3600:
         await query.answer("Кнопка устарела. Пришлите ссылку ещё раз.", show_alert=True)
@@ -203,20 +207,17 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def _download(url: str, platform: str, mode: str):
     async with DOWNLOAD_SEMAPHORE:
-        if platform == "YouTube" and mode == "fit":
+        if platform == "YouTube" and (mode == "original" or (mode == "video" and SETTINGS.yandex_disk_token)):
             return await asyncio.to_thread(
-                download_youtube_fit, url, SETTINGS.download_dir, SETTINGS.max_upload_mb,
+                download_youtube_original, url, SETTINGS.download_dir, SETTINGS.download_limit_mb,
                 SETTINGS.cookies_file, SETTINGS.ffmpeg_location,
-            )
-        if platform == "YouTube" and mode == "original":
-            return await asyncio.to_thread(
-                download_youtube_original, url, SETTINGS.download_dir, SETTINGS.max_upload_mb,
-                SETTINGS.cookies_file, SETTINGS.ffmpeg_location,
+                telegram_limit_mb=SETTINGS.max_upload_mb if mode == "video" else None,
             )
         if mode in {"ruvideo", "rusubs"}:
             return await asyncio.to_thread(
-                download_russian, url, platform, SETTINGS.download_dir, SETTINGS.max_upload_mb,
+                download_russian, url, platform, SETTINGS.download_dir, SETTINGS.download_limit_mb,
                 SETTINGS.cookies_file, SETTINGS.ffmpeg_location, subtitles=mode == "rusubs",
+                telegram_limit_mb=SETTINGS.max_upload_mb if SETTINGS.yandex_disk_token else None,
             )
 
         if platform == "Instagram" and mode in {"video", "original"}:
@@ -225,7 +226,7 @@ async def _download(url: str, platform: str, mode: str):
                     download_instagram_original,
                     url,
                     SETTINGS.download_dir,
-                    SETTINGS.max_upload_mb,
+                    SETTINGS.download_limit_mb,
                     SETTINGS.cookies_file,
                     SETTINGS.ffmpeg_location,
                 )
@@ -241,7 +242,7 @@ async def _download(url: str, platform: str, mode: str):
 
         return await asyncio.to_thread(
             download_audio if mode == "audio" else download_video,
-            url, platform, SETTINGS.download_dir, SETTINGS.max_upload_mb,
+            url, platform, SETTINGS.download_dir, SETTINGS.download_limit_mb,
             SETTINGS.cookies_file, SETTINGS.ffmpeg_location,
         )
 
@@ -257,23 +258,39 @@ def _cleanup_late_download(task):
 async def send_download(message, context, url: str, platform: str, mode: str) -> None:
     status = await message.reply_text("⏳ В очереди на скачивание…")
     task = None
+    upload_task = None
 
     try:
         label = {
             "audio": "MP3",
             "original": "оригинальный файл",
-            "fit": "видео под лимит размера — без изменения пропорций",
             "ruvideo": "видео с русской дорожкой",
             "rusubs": "русские субтитры",
         }.get(mode, "видео")
         await status.edit_text(f"⏳ Готовлю {label} из {platform}…")
         task = asyncio.create_task(_download(url, platform, mode))
-        result = await asyncio.wait_for(asyncio.shield(task), timeout=900 if mode == "fit" else 300)
+        result = await asyncio.wait_for(asyncio.shield(task), timeout=900 if SETTINGS.yandex_disk_token else 300)
 
         try:
+            if result.path.stat().st_size > SETTINGS.max_upload_mb * 1024 * 1024:
+                if not SETTINGS.yandex_disk_token:
+                    raise DiskError("Файл превышает лимит Telegram. Администратору нужно подключить Яндекс Диск: YANDEX_DISK_TOKEN.")
+                await status.edit_text("☁️ Файл больше лимита Telegram. Загружаю на Яндекс Диск без сжатия…")
+                async def transfer():
+                    async with DISK_SEMAPHORE:
+                        return await asyncio.to_thread(upload_file, result.path, SETTINGS.yandex_disk_token,
+                                                       SETTINGS.yandex_disk_folder)
+                upload_task = asyncio.create_task(transfer())
+                public_url = await asyncio.shield(upload_task)
+                await message.reply_text(
+                    f"✅ {result.platform} — {result.path.stat().st_size / 1024 / 1024:.1f} МБ\n"
+                    f"{result.title}\nФайл на Яндекс Диске. Ссылка доступна всем, у кого она есть.\n{public_url}",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("☁️ Скачать с Яндекс Диска", url=public_url)]]),
+                    disable_web_page_preview=True,
+                )
+                await status.delete()
+                return
             caption_lines = [f"✅ {result.platform}"]
-            if mode == "fit":
-                caption_lines.append("Сжат битрейт; разрешение и пропорции сохранены")
             if mode == "original":
                 caption_lines.append("📦 Оригинальный файл без обработки Telegram-плеером")
             elif mode == "ruvideo":
@@ -355,8 +372,19 @@ async def send_download(message, context, url: str, platform: str, mode: str) ->
                     )
             await status.delete()
         finally:
-            result.cleanup()
+            if upload_task is not None and not upload_task.done():
+                def finish_upload(completed):
+                    if not completed.cancelled():
+                        completed.exception()  # Consume a late error without logging signed URLs.
+                    result.cleanup()
+                upload_task.add_done_callback(finish_upload)
+            else:
+                result.cleanup()
 
+    except asyncio.CancelledError:
+        if task is not None and not task.done():
+            task.add_done_callback(_cleanup_late_download)
+        raise
     except asyncio.TimeoutError:
         if task is not None:
             task.add_done_callback(_cleanup_late_download)
@@ -367,8 +395,12 @@ async def send_download(message, context, url: str, platform: str, mode: str) ->
         await status.edit_text(
             f"⚠️ Файл весит {exc.size_mb:.1f} МБ и превышает установленный лимит "
             f"{exc.limit_mb} МБ."
-            + (f" Нажмите «Уместить в {SETTINGS.max_upload_mb} МБ»: бот сожмёт битрейт, сохранив пропорции." if platform == "YouTube" and mode != "fit" else "")
+            + (" Это предельный размер загрузки на сервер; сжатие отключено." if SETTINGS.yandex_disk_token
+               else " Для больших файлов администратору нужно подключить Яндекс Диск: YANDEX_DISK_TOKEN.")
         )
+    except DiskError as exc:
+        logger.warning("Yandex Disk delivery failed: %s", exc)
+        await status.edit_text(f"☁️ {exc}")
     except NoMediaFileError as exc:
         await status.edit_text(f"❌ {exc}")
     except DownloadError as exc:
