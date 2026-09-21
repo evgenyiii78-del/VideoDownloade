@@ -10,6 +10,32 @@ from yandex_disk import upload_file, DiskError, _safe_url
 
 
 class DiskTests(unittest.TestCase):
+    def test_chunks_are_bounded_and_cancellable(self):
+        import io
+        from yandex_disk import _file_chunks, CHUNK_SIZE
+        content = b'x' * (CHUNK_SIZE * 2 + 3)
+        updates = []
+        chunks = list(_file_chunks(io.BytesIO(content), lambda: None, updates.append))
+        self.assertEqual(b''.join(chunks), content)
+        self.assertLessEqual(max(map(len, chunks)), CHUNK_SIZE)
+        self.assertEqual(updates[-1], len(content))
+        def stopped():
+            raise DiskError('cancelled')
+        with self.assertRaises(DiskError):
+            next(_file_chunks(io.BytesIO(content), stopped, updates.append))
+
+    def test_network_timeout_reports_stage_without_signed_url(self):
+        real_client = httpx.Client
+        def handle(request):
+            raise httpx.ReadTimeout('secret signed URL', request=request)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'video.mp4'; path.write_bytes(b'x')
+            with patch('yandex_disk.httpx.Client', side_effect=lambda **kw: real_client(transport=httpx.MockTransport(handle), **kw)):
+                with self.assertRaises(DiskError) as caught:
+                    upload_file(path, 'test-only')
+        self.assertIn('проверка папки и доступа', str(caught.exception))
+        self.assertNotIn('secret', str(caught.exception))
+
     def test_upload_publish_stream_and_unique_names(self):
         paths = []
         uploaded = []
@@ -64,6 +90,24 @@ class DiskTests(unittest.TestCase):
 
 
 class DeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_total_deadline_signals_worker_and_keeps_task_alive(self):
+        import asyncio
+        import threading
+        os.environ.setdefault('BOT_TOKEN', '123456:TEST_TOKEN_FOR_OFFLINE_TESTS')
+        import bot
+        cancel = threading.Event()
+        gate = asyncio.Event()
+        task = asyncio.create_task(gate.wait())
+        try:
+            with self.assertRaisesRegex(DiskError, '10 минут'):
+                await bot.wait_for_disk(task, Mock(edit_text=AsyncMock()), [('отправка файла',0,1)], cancel, timeout=.02)
+            self.assertTrue(cancel.is_set())
+            self.assertFalse(task.cancelled())
+            self.assertFalse(task.done())
+        finally:
+            gate.set()
+            await task
+
     async def test_large_file_link_failure_and_small_video(self):
         os.environ.setdefault('BOT_TOKEN', '123456:TEST_TOKEN_FOR_OFFLINE_TESTS')
         import bot
@@ -78,7 +122,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 status = Mock(edit_text=AsyncMock(), delete=AsyncMock())
                 message = Mock(reply_text=AsyncMock(return_value=status), reply_video=AsyncMock())
                 settings = replace(bot.SETTINGS, max_upload_mb=1, yandex_disk_token='test-only')
-                def upload(*args):
+                def upload(*args, **kwargs):
                     self.assertTrue(path.exists())
                     if error:
                         raise error
@@ -121,7 +165,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             started = asyncio.Event()
             release = threading.Event()
             loop = asyncio.get_running_loop()
-            def upload(*args):
+            def upload(*args, **kwargs):
                 loop.call_soon_threadsafe(started.set)
                 release.wait(5)
                 return 'https://disk.yandex.ru/d/test'

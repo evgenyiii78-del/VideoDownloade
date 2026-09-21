@@ -4,13 +4,15 @@ import asyncio
 import logging
 import secrets
 import time
+import threading
+from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from config import Settings
-from yandex_disk import DiskError, upload_file
+from yandex_disk import DiskError, upload_file, UPLOAD_TIMEOUT
 from russian import download_russian
 from downloader import (
     DownloadError,
@@ -255,6 +257,35 @@ def _cleanup_late_download(task):
             pass
 
 
+async def wait_for_disk(task, status, state, cancel, timeout=UPLOAD_TIMEOUT):
+    """Bound the whole operation, including queueing; keep worker cleanup separate."""
+    deadline = time.monotonic() + timeout
+    last_text = None
+    try:
+        while not task.done():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DiskError("Загрузка на Яндекс Диск не завершилась за 10 минут. Попробуйте позже.")
+            done, _ = await asyncio.wait({task}, timeout=min(10, remaining))
+            if done:
+                break
+            stage, sent, total = state[0]
+            text = f"☁️ Яндекс Диск: {stage}."
+            if stage == "отправка файла" and total:
+                text += f"\nОтправлено {sent / total:.0%}: {sent / 1024 / 1024:.1f} из {total / 1024 / 1024:.1f} МБ."
+            if text != last_text:
+                try:
+                    await asyncio.wait_for(status.edit_text(text), timeout=5)
+                except Exception:
+                    logger.warning("Could not update Disk progress message")
+                last_text = text
+            logger.info("Yandex Disk progress: stage=%s; sent=%s; total=%s", stage, sent, total)
+        return task.result()
+    except BaseException:
+        cancel.set()
+        raise
+
+
 async def send_download(message, context, url: str, platform: str, mode: str) -> None:
     status = await message.reply_text("⏳ В очереди на скачивание…")
     task = None
@@ -275,13 +306,19 @@ async def send_download(message, context, url: str, platform: str, mode: str) ->
             if result.path.stat().st_size > SETTINGS.max_upload_mb * 1024 * 1024:
                 if not SETTINGS.yandex_disk_token:
                     raise DiskError("Файл превышает лимит Telegram. Администратору нужно подключить Яндекс Диск: YANDEX_DISK_TOKEN.")
-                await status.edit_text("☁️ Файл больше лимита Telegram. Загружаю на Яндекс Диск без сжатия…")
+                await status.edit_text("☁️ Файл больше лимита Telegram. Ожидаю отправку на Яндекс Диск…")
+                state = [("ожидание очереди", 0, result.path.stat().st_size)]
+                cancel = threading.Event()
+                def progress(stage, sent, total):
+                    state[0] = (stage, sent, total)
                 async def transfer():
                     async with DISK_SEMAPHORE:
+                        if cancel.is_set():
+                            raise DiskError("Ожидание отправки на Диск отменено.")
                         return await asyncio.to_thread(upload_file, result.path, SETTINGS.yandex_disk_token,
-                                                       SETTINGS.yandex_disk_folder)
+                                                       SETTINGS.yandex_disk_folder, progress=progress, cancel=cancel)
                 upload_task = asyncio.create_task(transfer())
-                public_url = await asyncio.shield(upload_task)
+                public_url = await wait_for_disk(upload_task, status, state, cancel)
                 await message.reply_text(
                     f"✅ {result.platform} — {result.path.stat().st_size / 1024 / 1024:.1f} МБ\n"
                     f"{result.title}\nФайл на Яндекс Диске. Ссылка доступна всем, у кого она есть.\n{public_url}",
@@ -432,7 +469,8 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
 
-    logger.info("VideoDownloaderBot started")
+    version = Path(__file__).with_name("VERSION").read_text().strip()
+    logger.info("VideoDownloaderBot v%s started; Yandex Disk configured=%s", version, bool(SETTINGS.yandex_disk_token))
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
