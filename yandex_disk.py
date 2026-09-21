@@ -11,6 +11,7 @@ API = "https://cloud-api.yandex.net/v1/disk"
 logger = logging.getLogger("video_downloader_bot.yandex_disk")
 UPLOAD_TIMEOUT = 600
 CHUNK_SIZE = 256 * 1024
+PUBLIC_URL_WAIT_SECONDS = 30
 
 
 def _file_chunks(stream, check, progress):
@@ -57,9 +58,11 @@ def upload_file(path: Path, token: str, folder: str = "VideoDownloaderBot", *, p
     deadline = time.monotonic() + UPLOAD_TIMEOUT
     total = path.stat().st_size if path.exists() else 0
     phase = "проверка настроек"
+
     def check():
         if (cancel is not None and cancel.is_set()) or time.monotonic() >= deadline:
             raise DiskError("Превышено общее время загрузки на Яндекс Диск (10 минут). Попробуйте позже.")
+
     def report(stage, sent=0):
         nonlocal phase
         if stage != phase:
@@ -67,6 +70,7 @@ def upload_file(path: Path, token: str, folder: str = "VideoDownloaderBot", *, p
         phase = stage
         if progress is not None:
             progress(stage, sent, total)
+
     if not token:
         raise DiskError("Яндекс Диск не подключён: администратору нужно задать YANDEX_DISK_TOKEN.")
     # One dedicated root-level folder; never overwrite or delete existing files.
@@ -74,8 +78,12 @@ def upload_file(path: Path, token: str, folder: str = "VideoDownloaderBot", *, p
         raise DiskError("YANDEX_DISK_FOLDER должен содержать одно имя папки без слешей и двоеточий.")
     root = "disk:/" + folder
     remote = root + "/" + uuid.uuid4().hex + path.suffix.lower()
-    headers = {"Authorization": "OAuth " + token,
-               "Accept": "application/json", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": "OAuth " + token,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
     try:
         with httpx.Client(timeout=httpx.Timeout(30, connect=15), follow_redirects=False) as client:
             def api(method, endpoint, **params):
@@ -93,31 +101,65 @@ def upload_file(path: Path, token: str, folder: str = "VideoDownloaderBot", *, p
                     raise DiskError("На Диске уже есть файл с именем папки бота. Измените YANDEX_DISK_FOLDER.")
             else:
                 _check(response)
+
             report("получение адреса загрузки")
             link = api("GET", "/resources/upload", path=remote, overwrite="false").json()
             href = _safe_url(link["href"])
+
             # No OAuth header on the signed upload URL; httpx streams the file.
             report("отправка файла")
             with path.open("rb") as stream:
-                response = client.put(href, content=_file_chunks(stream, check, lambda sent: report("отправка файла", sent)),
-                                      headers={"Content-Length": str(path.stat().st_size),
-                                               "Content-Type": "application/octet-stream"},
-                                      timeout=httpx.Timeout(30, connect=15))
+                response = client.put(
+                    href,
+                    content=_file_chunks(stream, check, lambda sent: report("отправка файла", sent)),
+                    headers={
+                        "Content-Length": str(path.stat().st_size),
+                        "Content-Type": "application/octet-stream",
+                    },
+                    timeout=httpx.Timeout(30, connect=15),
+                )
             _check(response)
+
             report("публикация ссылки", total)
-            api("PUT", "/resources/publish", path=remote)
+            publish_response = api("PUT", "/resources/publish", path=remote)
+            publish_data = publish_response.json() if publish_response.content else {}
+
+            # Yandex normally returns an href to the resource metadata after publish.
+            # Reading that href is the most reliable way to obtain public_url.
             resource = {}
-            for attempt in range(5):
+            metadata_href = publish_data.get("href") if isinstance(publish_data, dict) else None
+            if metadata_href:
+                report("получение публичной ссылки", total)
+                metadata_response = client.get(_safe_url(metadata_href), headers=headers)
+                _check(metadata_response)
+                resource = metadata_response.json()
+
+            # Some accounts/API responses expose public_url only after a short delay.
+            # Poll the resource metadata instead of failing immediately after 5 seconds.
+            wait_deadline = min(deadline, time.monotonic() + PUBLIC_URL_WAIT_SECONDS)
+            while not resource.get("public_url") and time.monotonic() < wait_deadline:
+                report("получение публичной ссылки", total)
                 resource = api("GET", "/resources", path=remote, fields="public_url,size").json()
                 if resource.get("public_url"):
                     break
                 time.sleep(1)
-            if resource.get("size") != path.stat().st_size:
+
+            remote_size = resource.get("size")
+            if remote_size is not None and remote_size != path.stat().st_size:
                 raise DiskError("Не удалось подтвердить полный размер файла на Яндекс Диске.")
+
+            public_url = resource.get("public_url")
+            if not public_url:
+                raise DiskError(
+                    "Файл загружен на Яндекс Диск, но сервис не вернул публичную ссылку. "
+                    "Попробуйте отправить ссылку на видео ещё раз."
+                )
+
             check()
-            public_url = _safe_url(resource["public_url"])
+            public_url = _safe_url(public_url)
             logger.info("Yandex Disk upload complete; file_bytes=%s", total)
             return public_url
+
     except httpx.TimeoutException as exc:
         logger.warning("Yandex Disk timeout: stage=%s; type=%s", phase, type(exc).__name__)
         raise DiskError(f"Яндекс Диск не ответил вовремя. Этап: {phase}. Попробуйте позже.") from None
