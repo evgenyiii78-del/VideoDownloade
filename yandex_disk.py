@@ -4,19 +4,38 @@ from urllib.parse import urlparse
 import uuid
 import time
 import logging
+import math
 
 import httpx
 
 API = "https://cloud-api.yandex.net/v1/disk"
 logger = logging.getLogger("video_downloader_bot.yandex_disk")
-UPLOAD_TIMEOUT = 600
-CHUNK_SIZE = 256 * 1024
+# Maximum wall-clock time for the outer bot wait. The actual worker deadline is
+# calculated from file size below, so small files still fail much sooner.
+UPLOAD_TIMEOUT = 90 * 60
+MIN_UPLOAD_TIMEOUT = 15 * 60
+BASE_UPLOAD_TIMEOUT = 10 * 60
+SECONDS_PER_64_MIB = 10 * 60
+CHUNK_SIZE = 1024 * 1024
 PUBLIC_URL_WAIT_SECONDS = 30
 API_TIMEOUT = httpx.Timeout(30, connect=15)
-# A large upload can legitimately spend more than 30 seconds blocked while the
-# remote side/network drains a socket buffer. Keep API calls short, but allow
-# the signed upload stream to wait much longer for writes to make progress.
-UPLOAD_STREAM_TIMEOUT = httpx.Timeout(connect=15, read=60, write=300, pool=30)
+# A large upload can legitimately spend a long time blocked while the remote
+# side/network drains a socket buffer. Keep API calls short, but allow the
+# signed upload stream to wait for writes to make progress.
+UPLOAD_STREAM_TIMEOUT = httpx.Timeout(connect=15, read=120, write=600, pool=30)
+
+
+def upload_timeout_for_size(size_bytes: int) -> int:
+    """Return a bounded upload deadline that scales with file size.
+
+    64 MiB => at least 20 minutes, ~143 MiB => 40 minutes,
+    512 MiB => 90 minutes. This is intentionally conservative for slow VPS
+    uplinks while still keeping a finite upper bound.
+    """
+    size_bytes = max(0, int(size_bytes or 0))
+    units = max(1, math.ceil(size_bytes / (64 * 1024 * 1024)))
+    calculated = BASE_UPLOAD_TIMEOUT + units * SECONDS_PER_64_MIB
+    return min(UPLOAD_TIMEOUT, max(MIN_UPLOAD_TIMEOUT, calculated))
 
 
 def _file_chunks(stream, check, progress):
@@ -60,18 +79,30 @@ def _safe_url(url):
 
 
 def upload_file(path: Path, token: str, folder: str = "VideoDownloaderBot", *, progress=None, cancel=None) -> str:
-    deadline = time.monotonic() + UPLOAD_TIMEOUT
     total = path.stat().st_size if path.exists() else 0
+    upload_timeout = upload_timeout_for_size(total)
+    deadline = time.monotonic() + upload_timeout
+    timeout_minutes = math.ceil(upload_timeout / 60)
     phase = "проверка настроек"
 
     def check():
-        if (cancel is not None and cancel.is_set()) or time.monotonic() >= deadline:
-            raise DiskError("Превышено общее время загрузки на Яндекс Диск (10 минут). Попробуйте позже.")
+        if cancel is not None and cancel.is_set():
+            raise DiskError("Загрузка на Яндекс Диск отменена.")
+        if time.monotonic() >= deadline:
+            raise DiskError(
+                f"Загрузка на Яндекс Диск не завершилась за {timeout_minutes} минут. "
+                "Попробуйте позже."
+            )
 
     def report(stage, sent=0):
         nonlocal phase
         if stage != phase:
-            logger.info("Yandex Disk stage: %s; file_bytes=%s", stage, total)
+            logger.info(
+                "Yandex Disk stage: %s; file_bytes=%s; timeout_minutes=%s",
+                stage,
+                total,
+                timeout_minutes,
+            )
         phase = stage
         if progress is not None:
             progress(stage, sent, total)
@@ -140,7 +171,6 @@ def upload_file(path: Path, token: str, folder: str = "VideoDownloaderBot", *, p
                 resource = metadata_response.json()
 
             # Some accounts/API responses expose public_url only after a short delay.
-            # Poll the resource metadata instead of failing immediately after 5 seconds.
             wait_deadline = min(deadline, time.monotonic() + PUBLIC_URL_WAIT_SECONDS)
             while not resource.get("public_url") and time.monotonic() < wait_deadline:
                 report("получение публичной ссылки", total)
