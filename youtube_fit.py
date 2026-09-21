@@ -1,11 +1,14 @@
 """Explicit size-limited encoding; keep the source frame geometry."""
 import re
+import logging
 import subprocess
 from dataclasses import replace
 
 from downloader import (NoMediaFileError, _ffmpeg_binary, _check_size,
                         _video_display_dimensions, download_youtube_original)
 
+
+logger = logging.getLogger("video_downloader_bot.youtube_fit")
 
 def fit_video(result, limit_mb, ffmpeg=None):
     binary = _ffmpeg_binary(ffmpeg)
@@ -36,8 +39,18 @@ def fit_video(result, limit_mb, ffmpeg=None):
                                   '-b:a', str(audio_rate), '-sn', '-dn', '-movflags',
                                   '+faststart', str(target)],
                        check=True, capture_output=True, timeout=360)
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise NoMediaFileError('Не удалось сжать ролик за отведённое время. Попробуйте более короткое видео.') from exc
+    except subprocess.TimeoutExpired as exc:
+        logger.warning("FFmpeg size encoding timed out after %s seconds", exc.timeout)
+        raise NoMediaFileError('Сжатие превысило время обработки на сервере.') from exc
+    except subprocess.CalledProcessError as exc:
+        details = exc.stderr or b''
+        if isinstance(details, bytes):
+            details = details.decode('utf-8', errors='replace')
+        logger.error("FFmpeg size encoding failed: exit=%s; stderr=%s", exc.returncode, details[-6000:])
+        raise NoMediaFileError('FFmpeg завершился с ошибкой обработки. Причина записана в логах бота: FFmpeg size encoding failed.') from exc
+    except OSError as exc:
+        logger.error("Unable to run FFmpeg: %s", exc)
+        raise NoMediaFileError('Не удалось запустить FFmpeg на сервере. Причина записана в логах бота.') from exc
     size = _check_size(target, limit_mb)
     width, height = _video_display_dimensions(target, ffmpeg)
     return replace(result, path=target, size_bytes=size, width=width, height=height,
