@@ -12,6 +12,11 @@ logger = logging.getLogger("video_downloader_bot.yandex_disk")
 UPLOAD_TIMEOUT = 600
 CHUNK_SIZE = 256 * 1024
 PUBLIC_URL_WAIT_SECONDS = 30
+API_TIMEOUT = httpx.Timeout(30, connect=15)
+# A large upload can legitimately spend more than 30 seconds blocked while the
+# remote side/network drains a socket buffer. Keep API calls short, but allow
+# the signed upload stream to wait much longer for writes to make progress.
+UPLOAD_STREAM_TIMEOUT = httpx.Timeout(connect=15, read=60, write=300, pool=30)
 
 
 def _file_chunks(stream, check, progress):
@@ -85,7 +90,7 @@ def upload_file(path: Path, token: str, folder: str = "VideoDownloaderBot", *, p
     }
 
     try:
-        with httpx.Client(timeout=httpx.Timeout(30, connect=15), follow_redirects=False) as client:
+        with httpx.Client(timeout=API_TIMEOUT, follow_redirects=False) as client:
             def api(method, endpoint, **params):
                 check()
                 response = client.request(method, API + endpoint, headers=headers, params=params)
@@ -116,7 +121,7 @@ def upload_file(path: Path, token: str, folder: str = "VideoDownloaderBot", *, p
                         "Content-Length": str(path.stat().st_size),
                         "Content-Type": "application/octet-stream",
                     },
-                    timeout=httpx.Timeout(30, connect=15),
+                    timeout=UPLOAD_STREAM_TIMEOUT,
                 )
             _check(response)
 
