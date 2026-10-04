@@ -18,6 +18,11 @@ BASE_UPLOAD_TIMEOUT = 10 * 60
 SECONDS_PER_64_MIB = 10 * 60
 CHUNK_SIZE = 1024 * 1024
 PUBLIC_URL_WAIT_SECONDS = 30
+# When all bytes have left our process but the signed upload endpoint is slow to
+# return its HTTP response, verify the remote resource before declaring failure.
+# This avoids the common "100% uploaded -> timeout" false-negative.
+UPLOAD_CONFIRM_WAIT_SECONDS = 3 * 60
+UPLOAD_CONFIRM_POLL_SECONDS = 2
 API_TIMEOUT = httpx.Timeout(30, connect=15)
 # A large upload can legitimately spend a long time blocked while the remote
 # side/network drains a socket buffer. Keep API calls short, but allow the
@@ -128,6 +133,33 @@ def upload_file(path: Path, token: str, folder: str = "VideoDownloaderBot", *, p
                 _check(response)
                 return response
 
+            def verify_completed_upload() -> bool:
+                """Confirm that Yandex stored the full file after a delayed upload ACK."""
+                verify_deadline = min(deadline, time.monotonic() + UPLOAD_CONFIRM_WAIT_SECONDS)
+                while time.monotonic() < verify_deadline:
+                    check()
+                    report("проверка сохранения файла", total)
+                    response = client.get(
+                        API + "/resources",
+                        headers=headers,
+                        params={"path": remote, "fields": "size,type"},
+                    )
+                    if response.status_code == 404:
+                        time.sleep(UPLOAD_CONFIRM_POLL_SECONDS)
+                        continue
+                    _check(response)
+                    resource = response.json()
+                    remote_size = resource.get("size")
+                    if resource.get("type") == "file" and remote_size == total:
+                        logger.info(
+                            "Yandex Disk upload ACK timed out, but remote file is complete; file_bytes=%s",
+                            total,
+                        )
+                        return True
+                    # The resource may appear before Yandex has committed its final size.
+                    time.sleep(UPLOAD_CONFIRM_POLL_SECONDS)
+                return False
+
             report("проверка папки и доступа")
             check()
             response = client.put(API + "/resources", headers=headers, params={"path": root})
@@ -144,17 +176,34 @@ def upload_file(path: Path, token: str, folder: str = "VideoDownloaderBot", *, p
 
             # No OAuth header on the signed upload URL; httpx streams the file.
             report("отправка файла")
-            with path.open("rb") as stream:
-                response = client.put(
-                    href,
-                    content=_file_chunks(stream, check, lambda sent: report("отправка файла", sent)),
-                    headers={
-                        "Content-Length": str(path.stat().st_size),
-                        "Content-Type": "application/octet-stream",
-                    },
-                    timeout=UPLOAD_STREAM_TIMEOUT,
-                )
-            _check(response)
+
+            def upload_progress(sent):
+                if total and sent >= total:
+                    report("файл передан 100%, жду подтверждение", sent)
+                else:
+                    report("отправка файла", sent)
+
+            try:
+                with path.open("rb") as stream:
+                    response = client.put(
+                        href,
+                        content=_file_chunks(stream, check, upload_progress),
+                        headers={
+                            "Content-Length": str(path.stat().st_size),
+                            "Content-Type": "application/octet-stream",
+                        },
+                        timeout=UPLOAD_STREAM_TIMEOUT,
+                    )
+                _check(response)
+            except httpx.ReadTimeout:
+                # A read timeout here happens after the request body was sent. Yandex
+                # can already have the complete file even though its upload endpoint
+                # did not acknowledge it within the 120 s read window.
+                if not verify_completed_upload():
+                    raise DiskError(
+                        "Файл был передан на Яндекс Диск, но сервис не подтвердил его сохранение. "
+                        "Попробуйте позже."
+                    ) from None
 
             report("публикация ссылки", total)
             publish_response = api("PUT", "/resources/publish", path=remote)
