@@ -28,18 +28,19 @@ class ExtractSupportedUrlTests(unittest.TestCase):
         self.assertEqual(url, "https://vm.tiktok.com/ABCDEFG/")
 
     def test_ok_video(self):
+        # Real link used during integration testing.
         url, platform = extract_supported_url(
-            "https://ok.ru/video/1234567890"
+            "https://ok.ru/video/1073893280381"
         )
         self.assertEqual(platform, "OK.ru")
-        self.assertEqual(url, "https://ok.ru/video/1234567890")
+        self.assertEqual(url, "https://ok.ru/video/1073893280381")
 
     def test_ok_mobile_video(self):
         url, platform = extract_supported_url(
             "https://m.ok.ru/video/1234567890"
         )
         self.assertEqual(platform, "OK.ru")
-        self.assertEqual(url, "https://m.ok.ru/video/1234567890")
+        self.assertEqual(url, "https://ok.ru/video/1234567890")
 
     def test_odnoklassniki_legacy_domain(self):
         url, platform = extract_supported_url(
