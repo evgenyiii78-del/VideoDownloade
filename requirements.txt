@@ -1,5 +1,5 @@
 python-telegram-bot==22.8
-yt-dlp[default,curl-cffi]
+yt-dlp[default,curl-cffi]>=2026.10.21
 python-dotenv
 imageio-ffmpeg==0.6.0
 nodejs-wheel-binaries==22.20.0
