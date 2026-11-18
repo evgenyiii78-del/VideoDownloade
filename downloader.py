@@ -171,9 +171,9 @@ def extract_supported_url(text: str) -> tuple[str, str]:
         ):
             platform = "Pinterest"
 
-        if platform == "OK.ru" and host in {"m.ok.ru", "m.odnoklassniki.ru"}:
-            # yt-dlp's Odnoklassniki extractor accepts ok.ru / www.ok.ru but
-            # not the mobile m.* host. Normalize mobile share links first.
+        if platform == "OK.ru" and host != "ok.ru":
+            # Canonicalize OK.ru links so the extractor and the .ok.ru service
+            # cookies behave consistently for mobile/legacy share URLs.
             raw_url = urlunparse((
                 parsed.scheme,
                 "ok.ru",
@@ -592,6 +592,28 @@ def download_video(
                 logger.warning("Instagram public download failed: %s", exc)
             elif platform == "TikTok":
                 logger.warning("TikTok yt-dlp download failed: %s", exc)
+            elif platform == "OK.ru":
+                logger.warning("OK.ru public download failed: %s", exc)
+
+        # OK.ru restricted videos: retry with the bot's authenticated service
+        # cookies. Public videos still use the unauthenticated path above.
+        if platform == "OK.ru" and cookies_file is not None:
+            _clear_work_dir(work_dir)
+            try:
+                return _download_with_ytdlp(
+                    url=url,
+                    platform=platform,
+                    work_dir=work_dir,
+                    max_upload_mb=max_upload_mb,
+                    cookies_file=cookies_file,
+                    ffmpeg_location=ffmpeg_location,
+                    source_label="yt-dlp-ok-session",
+                )
+            except FileTooLargeError:
+                raise
+            except Exception as exc:
+                auth_error = exc
+                logger.warning("OK.ru service-session download failed: %s", exc)
 
         # TikTok fallback: TikTok frequently blocks datacenter IPs or changes
         # its anti-bot challenge. TikWM gives us a second independent path.
@@ -655,6 +677,12 @@ def download_video(
                     f"{auth_state}"
                     f"proxy fallback failed: {proxy_exc}"
                 ) from proxy_exc
+
+        if platform == "OK.ru" and auth_error is not None:
+            raise DownloadError(
+                f"OK.ru public download failed: {public_error}; "
+                f"service session failed: {auth_error}"
+            ) from auth_error
 
         if isinstance(public_error, DownloadError):
             raise public_error
