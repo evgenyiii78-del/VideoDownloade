@@ -27,6 +27,27 @@ class ExtractSupportedUrlTests(unittest.TestCase):
         self.assertEqual(platform, "TikTok")
         self.assertEqual(url, "https://vm.tiktok.com/ABCDEFG/")
 
+    def test_ok_video(self):
+        url, platform = extract_supported_url(
+            "https://ok.ru/video/1234567890"
+        )
+        self.assertEqual(platform, "OK.ru")
+        self.assertEqual(url, "https://ok.ru/video/1234567890")
+
+    def test_ok_mobile_video(self):
+        url, platform = extract_supported_url(
+            "https://m.ok.ru/video/1234567890"
+        )
+        self.assertEqual(platform, "OK.ru")
+        self.assertEqual(url, "https://m.ok.ru/video/1234567890")
+
+    def test_odnoklassniki_legacy_domain(self):
+        url, platform = extract_supported_url(
+            "https://www.odnoklassniki.ru/video/1234567890"
+        )
+        self.assertEqual(platform, "OK.ru")
+        self.assertEqual(url, "https://www.odnoklassniki.ru/video/1234567890")
+
     def test_unsupported_domain(self):
         with self.assertRaises(UnsupportedUrlError):
             extract_supported_url("https://example.com/video/1")
