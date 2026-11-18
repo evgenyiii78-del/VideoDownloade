@@ -171,6 +171,18 @@ def extract_supported_url(text: str) -> tuple[str, str]:
         ):
             platform = "Pinterest"
 
+        if platform == "OK.ru" and host in {"m.ok.ru", "m.odnoklassniki.ru"}:
+            # yt-dlp's Odnoklassniki extractor accepts ok.ru / www.ok.ru but
+            # not the mobile m.* host. Normalize mobile share links first.
+            raw_url = urlunparse((
+                parsed.scheme,
+                "ok.ru",
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment,
+            ))
+
         if platform:
             return raw_url, platform
     raise UnsupportedUrlError("No supported video URL found")
