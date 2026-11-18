@@ -18,26 +18,54 @@ def _int_env(name: str, default: int) -> int:
         raise RuntimeError(f"{name} must be an integer, got: {value!r}") from exc
 
 
-def _build_instagram_cookie_file(download_dir: Path) -> Path | None:
-    """Build a Netscape cookie file from Instagram cookie values stored in .env."""
-    sessionid = os.getenv("INSTAGRAM_SESSIONID", "").strip()
-    if not sessionid:
-        return None
-
-    csrftoken = os.getenv("INSTAGRAM_CSRFTOKEN", "").strip()
-    ds_user_id = os.getenv("INSTAGRAM_DS_USER_ID", "").strip()
-
-    cookie_path = download_dir / ".instagram_cookies.txt"
+def _build_service_cookie_file(download_dir: Path) -> Path | None:
+    """Build one Netscape cookie file from service-session values stored in .env."""
     lines = [
         "# Netscape HTTP Cookie File",
         "# Generated at runtime from environment variables. Do not commit this file.",
-        f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t{sessionid}",
     ]
-    if csrftoken:
-        lines.append(f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tcsrftoken\t{csrftoken}")
-    if ds_user_id:
-        lines.append(f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tds_user_id\t{ds_user_id}")
 
+    # Instagram service session.
+    sessionid = os.getenv("INSTAGRAM_SESSIONID", "").strip()
+    if sessionid:
+        csrftoken = os.getenv("INSTAGRAM_CSRFTOKEN", "").strip()
+        ds_user_id = os.getenv("INSTAGRAM_DS_USER_ID", "").strip()
+        lines.append(
+            f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t{sessionid}"
+        )
+        if csrftoken:
+            lines.append(
+                f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tcsrftoken\t{csrftoken}"
+            )
+        if ds_user_id:
+            lines.append(
+                f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tds_user_id\t{ds_user_id}"
+            )
+
+    # OK.ru: accept the complete Cookie request-header value copied from an
+    # authenticated browser. Keeping this as one env var is convenient on
+    # hosting services where mounting cookies.txt is awkward.
+    ok_cookies = os.getenv("OK_COOKIES", "").strip()
+    if ok_cookies:
+        for item in ok_cookies.split(";"):
+            item = item.strip()
+            if not item or "=" not in item:
+                continue
+            name, value = item.split("=", 1)
+            name = name.strip()
+            value = value.strip()
+            if not name or name.startswith("$") or any(ch in name for ch in "\t\r\n"):
+                continue
+            if any(ch in value for ch in "\t\r\n"):
+                continue
+            lines.append(
+                f".ok.ru\tTRUE\t/\tTRUE\t2147483647\t{name}\t{value}"
+            )
+
+    if len(lines) == 2:
+        return None
+
+    cookie_path = download_dir / ".service_cookies.txt"
     cookie_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     try:
         cookie_path.chmod(0o600)
@@ -78,7 +106,7 @@ class Settings:
             raise RuntimeError(f"COOKIES_FILE does not exist: {cookies_file}")
 
         if cookies_file is None:
-            cookies_file = _build_instagram_cookie_file(download_dir)
+            cookies_file = _build_service_cookie_file(download_dir)
 
         ffmpeg_location = resolve_ffmpeg()
 
