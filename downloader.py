@@ -42,6 +42,12 @@ SUPPORTED_HOSTS = {
     "m.tiktok.com": "TikTok",
     "vm.tiktok.com": "TikTok",
     "vt.tiktok.com": "TikTok",
+    "ok.ru": "OK.ru",
+    "www.ok.ru": "OK.ru",
+    "m.ok.ru": "OK.ru",
+    "odnoklassniki.ru": "OK.ru",
+    "www.odnoklassniki.ru": "OK.ru",
+    "m.odnoklassniki.ru": "OK.ru",
 }
 
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
