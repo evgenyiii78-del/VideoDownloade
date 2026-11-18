@@ -42,7 +42,7 @@ DOWNLOAD_SEMAPHORE = asyncio.Semaphore(SETTINGS.max_concurrent_downloads)
 DISK_SEMAPHORE = asyncio.Semaphore(1)
 
 WELCOME = (
-    "🎬 Отправьте ссылку на ролик из Instagram, TikTok, YouTube или Pinterest.\n\n"
+    "🎬 Отправьте ссылку на ролик из Instagram, TikTok, YouTube, Pinterest или OK.ru.\n\n"
     "Поддерживаются YouTube Shorts и короткие ссылки youtu.be / pin.it.\n"
     "После ссылки выберите: 🎬 Видео или 🎵 MP3.\n"
     "Instagram: дополнительно доступен 📦 Оригинал — файл без обработки Telegram-плеером.\n"
@@ -146,7 +146,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         url, platform = extract_supported_url(message.text)
     except UnsupportedUrlError:
         record_user(USERS_DB, update.effective_user)
-        await message.reply_text("Пришлите ссылку на Instagram, TikTok, YouTube или Pinterest.")
+        await message.reply_text("Пришлите ссылку на Instagram, TikTok, YouTube, Pinterest или OK.ru.")
         return
 
     record_user(USERS_DB, update.effective_user, increment_requests=True)
