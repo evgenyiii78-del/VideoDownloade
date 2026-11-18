@@ -47,7 +47,7 @@ class ExtractSupportedUrlTests(unittest.TestCase):
             "https://www.odnoklassniki.ru/video/1234567890"
         )
         self.assertEqual(platform, "OK.ru")
-        self.assertEqual(url, "https://www.odnoklassniki.ru/video/1234567890")
+        self.assertEqual(url, "https://ok.ru/video/1234567890")
 
     def test_unsupported_domain(self):
         with self.assertRaises(UnsupportedUrlError):
